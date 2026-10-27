@@ -1,0 +1,1140 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Boulder Inversion Tracker & Predictor</title>
+  
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            alpine: {
+              900: '#0b1120',
+              800: '#111827',
+              700: '#1e293b',
+              600: '#334155',
+              gold: '#f59e0b',
+              teal: '#06b6d4',
+              mist: '#e2e8f0',
+            }
+          },
+          fontFamily: {
+            sans: ['Inter', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace'],
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- Google Fonts & FontAwesome Icons -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+  <style>
+    body {
+      font-family: 'Inter', sans-serif;
+      background-color: #080c14;
+      color: #f8fafc;
+    }
+    
+    /* Custom Glassmorphism Effect */
+    .glass-card {
+      background: rgba(15, 23, 42, 0.75);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    
+    .glass-card-hover {
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .glass-card-hover:hover {
+      border-color: rgba(6, 182, 212, 0.4);
+      transform: translateY(-2px);
+      box-shadow: 0 10px 25px -5px rgba(6, 182, 212, 0.15);
+    }
+
+    /* Gauge Arc Animation */
+    .gauge-circle {
+      transition: stroke-dashoffset 1.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    /* SVG Cross-Section Animations */
+    .fog-layer {
+      transition: all 0.8s ease-in-out;
+    }
+    
+    .sun-glow {
+      animation: pulseGlow 4s infinite alternate ease-in-out;
+    }
+
+    @keyframes pulseGlow {
+      0% { opacity: 0.7; transform: scale(1); }
+      100% { opacity: 1; transform: scale(1.08); }
+    }
+
+    /* Custom Scrollbars */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #0f172a;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 4px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #06b6d4;
+    }
+  </style>
+</head>
+<body class="min-h-screen text-slate-100 flex flex-col justify-between selection:bg-cyan-500 selection:text-slate-950">
+
+  <!-- TOP NAVIGATION HEADER -->
+  <header class="border-b border-slate-800/80 bg-slate-950/80 sticky top-0 z-50 backdrop-blur-md">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+      
+      <!-- Brand Logo & Location -->
+      <div class="flex items-center space-x-3">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-cyan-600 to-amber-500 flex items-center justify-center shadow-lg shadow-cyan-500/20">
+          <i class="fa-solid font-bold text-slate-950 text-xl fa-mountain-sun"></i>
+        </div>
+        <div>
+          <div class="flex items-center space-x-2">
+            <h1 class="font-extrabold text-lg tracking-tight bg-gradient-to-r from-white via-slate-200 to-slate-400 bg-clip-text text-transparent">
+              Boulder Inversion Tracker
+            </h1>
+            <span class="text-xs bg-cyan-950 text-cyan-400 border border-cyan-800/60 font-semibold px-2 py-0.5 rounded-full">
+              Green Mt. vs Valley
+            </span>
+          </div>
+          <p class="text-xs text-slate-400 flex items-center space-x-1">
+            <i class="fa-solid fa-location-dot text-cyan-400 text-[10px]"></i>
+            <span>Boulder, CO (5,300 ft &rarr; 8,144 ft)</span>
+          </p>
+        </div>
+      </div>
+
+      <!-- Live API Status Indicator -->
+      <div class="flex items-center space-x-3">
+        <div id="statusBadge" class="hidden sm:flex items-center space-x-2 bg-slate-900/90 border border-slate-700/60 rounded-full px-3 py-1 text-xs">
+          <span class="relative flex h-2 w-2">
+            <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+            <span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+          </span>
+          <span id="apiStatusText" class="text-slate-300 font-medium">Open-Meteo Synced</span>
+        </div>
+
+        <button onclick="fetchWeatherData()" class="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition" title="Refresh Live Data">
+          <i class="fa-solid fa-rotate-right text-sm" id="refreshIcon"></i>
+        </button>
+      </div>
+
+    </div>
+  </header>
+
+  <!-- MAIN WRAPPER -->
+  <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6 flex-grow w-full">
+
+    <!-- PRESET TESTER BAR -->
+    <section class="glass-card rounded-2xl p-3 flex flex-wrap items-center justify-between gap-3 border-cyan-900/40">
+      <div class="flex items-center space-x-2 text-xs font-semibold uppercase tracking-wider text-slate-400 pl-2">
+        <i class="fa-solid fa-sliders text-cyan-400"></i>
+        <span>Scenario Presets:</span>
+      </div>
+      
+      <div class="flex flex-wrap items-center gap-2 text-xs">
+        <button onclick="loadPreset('live')" id="btn-live" class="preset-btn px-3 py-1.5 rounded-xl font-medium border border-cyan-500 bg-cyan-950/60 text-cyan-300 shadow-sm transition">
+          <i class="fa-solid fa-satellite-dish mr-1"></i> Live Forecast
+        </button>
+        <button onclick="loadPreset('epic')" id="btn-epic" class="preset-btn px-3 py-1.5 rounded-xl font-medium border border-slate-700 bg-slate-900 text-slate-300 hover:border-emerald-500/50 hover:text-emerald-400 transition">
+          🏆 Epic Classic Inversion
+        </button>
+        <button onclick="loadPreset('socked')" id="btn-socked" class="preset-btn px-3 py-1.5 rounded-xl font-medium border border-slate-700 bg-slate-900 text-slate-300 hover:border-blue-500/50 hover:text-blue-400 transition">
+          🌁 Deep Fog Deck (Socked In)
+        </button>
+        <button onclick="loadPreset('clear')" id="btn-clear" class="preset-btn px-3 py-1.5 rounded-xl font-medium border border-slate-700 bg-slate-900 text-slate-300 hover:border-amber-500/50 hover:text-amber-400 transition">
+          ☀️ Bluebird Sky (No Fog)
+        </button>
+        <button onclick="loadPreset('chinook')" id="btn-chinook" class="preset-btn px-3 py-1.5 rounded-xl font-medium border border-slate-700 bg-slate-900 text-slate-300 hover:border-rose-500/50 hover:text-rose-400 transition">
+          💨 Downslope Chinook
+        </button>
+      </div>
+    </section>
+
+    <!-- HERO SECTION: GAUGE & SVG DIAGRAM GRID -->
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+      
+      <!-- HERO ITEM 1: PROBABILITY GAUGE CARD (5 COLS) -->
+      <div class="lg:col-span-5 glass-card rounded-3xl p-6 flex flex-col justify-between relative overflow-hidden">
+        <div class="absolute -top-12 -left-12 w-48 h-48 bg-cyan-500/10 rounded-full blur-3xl pointer-events-none"></div>
+        <div class="absolute -bottom-12 -right-12 w-48 h-48 bg-amber-500/10 rounded-full blur-3xl pointer-events-none"></div>
+
+        <!-- Header -->
+        <div class="flex items-center justify-between z-10">
+          <div>
+            <span class="text-xs font-bold tracking-widest text-cyan-400 uppercase">Tomorrow Morning Window</span>
+            <h2 class="text-xl font-extrabold text-white mt-0.5">Inversion Probability</h2>
+          </div>
+          <span class="text-xs text-slate-400 font-mono" id="targetDateText">06:00 - 09:00 AM MDT</span>
+        </div>
+
+        <!-- Radial Gauge & Big Percentage Display -->
+        <div class="my-6 flex flex-col items-center justify-center relative z-10">
+          <div class="relative w-56 h-56 flex items-center justify-center">
+            
+            <!-- SVG Circle Gauge -->
+            <svg class="w-full h-full transform -rotate-90" viewBox="0 0 120 120">
+              <!-- Background Track -->
+              <circle cx="60" cy="60" r="50" class="stroke-slate-800" stroke-width="10" fill="transparent" />
+              <!-- Gauge Progress Arc -->
+              <circle id="gaugeArc" cx="60" cy="60" r="50" class="gauge-circle stroke-cyan-400" stroke-width="10" 
+                      stroke-linecap="round" fill="transparent" stroke-dasharray="314.15" stroke-dashoffset="314.15" />
+            </svg>
+
+            <!-- Inner Value Content -->
+            <div class="absolute flex flex-col items-center justify-center text-center">
+              <span id="probPercent" class="text-5xl font-black tracking-tight text-white font-mono">--%</span>
+              <span id="probCategory" class="text-xs font-bold uppercase tracking-wider text-cyan-400 mt-1 px-3 py-1 bg-slate-900/90 rounded-full border border-cyan-800/40">
+                Calculating...
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Dynamic Verdict Summary -->
+        <div class="z-10 bg-slate-900/80 rounded-2xl p-4 border border-slate-800">
+          <div class="flex items-start space-x-3">
+            <div id="verdictIconContainer" class="p-2.5 rounded-xl bg-cyan-950 text-cyan-400 text-lg flex-shrink-0">
+              <i class="fa-solid fa-mountain" id="verdictIcon"></i>
+            </div>
+            <div>
+              <h3 id="verdictTitle" class="font-bold text-sm text-slate-100">Analyzing Atmospheric Sounding</h3>
+              <p id="verdictDesc" class="text-xs text-slate-400 mt-1 leading-relaxed">
+                Evaluating surface moisture, low cloud cover, and thermal cap aloft...
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- HERO ITEM 2: INTERACTIVE SVG ELEVATION CROSS-SECTION (7 COLS) -->
+      <div class="lg:col-span-7 glass-card rounded-3xl p-6 flex flex-col justify-between relative overflow-hidden">
+        
+        <!-- Header & Elevation Legend -->
+        <div class="flex flex-wrap items-center justify-between gap-2 z-10 mb-2">
+          <div>
+            <span class="text-xs font-bold tracking-widest text-amber-400 uppercase">Interactive Vertical Profile</span>
+            <h2 class="text-xl font-extrabold text-white">Boulder Valley Cross-Section</h2>
+          </div>
+
+          <!-- Legend -->
+          <div class="flex items-center space-x-4 text-[11px] text-slate-300">
+            <div class="flex items-center space-x-1.5">
+              <span class="w-3 h-3 rounded bg-slate-300/40 border border-slate-200"></span>
+              <span>Low Fog Deck</span>
+            </div>
+            <div class="flex items-center space-x-1.5">
+              <span class="w-3 h-0.5 bg-rose-500"></span>
+              <span>Thermal Cap</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Interactive SVG Canvas -->
+        <div class="relative w-full h-72 rounded-2xl bg-slate-950/80 border border-slate-800/80 overflow-hidden my-2 flex items-center justify-center">
+          
+          <svg id="elevationSVG" viewBox="0 0 800 400" class="w-full h-full object-cover">
+            <defs>
+              <!-- Sun Gradient -->
+              <radialGradient id="sunGlow" cx="50%" cy="50%" r="50%">
+                <stop offset="0%" stop-color="#f59e0b" stop-opacity="1" />
+                <stop offset="40%" stop-color="#fbbf24" stop-opacity="0.6" />
+                <stop offset="100%" stop-color="#f59e0b" stop-opacity="0" />
+              </radialGradient>
+
+              <!-- Terrain Gradient -->
+              <linearGradient id="mountainGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#334155" />
+                <stop offset="100%" stop-color="#0f172a" />
+              </linearGradient>
+
+              <!-- Cloud Fog Layer Gradient -->
+              <linearGradient id="fogGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#e2e8f0" stop-opacity="0.85" />
+                <stop offset="100%" stop-color="#94a3b8" stop-opacity="0.4" />
+              </linearGradient>
+
+              <filter id="blurFog">
+                <feGaussianBlur stdDeviation="4" />
+              </filter>
+            </defs>
+
+            <!-- Sky Background Grid -->
+            <line x1="0" y1="100" x2="800" y2="100" stroke="#1e293b" stroke-dasharray="4 4" />
+            <line x1="0" y1="200" x2="800" y2="200" stroke="#1e293b" stroke-dasharray="4 4" />
+            <line x1="0" y1="300" x2="800" y2="300" stroke="#1e293b" stroke-dasharray="4 4" />
+
+            <!-- Elevation Altitude Ticks (Y-axis MSL) -->
+            <text x="15" y="65" fill="#64748b" font-size="11" font-family="JetBrains Mono">8,500 ft</text>
+            <text x="15" y="145" fill="#64748b" font-size="11" font-family="JetBrains Mono">7,500 ft (Inversion Cap)</text>
+            <text x="15" y="245" fill="#64748b" font-size="11" font-family="JetBrains Mono">6,200 ft (NCAR/Chautauqua)</text>
+            <text x="15" y="340" fill="#64748b" font-size="11" font-family="JetBrains Mono">5,300 ft (Boulder Valley)</text>
+
+            <!-- Morning Sun (Positioned over Green Mountain Peak) -->
+            <g id="sunGroup" class="sun-glow">
+              <circle cx="680" cy="70" r="45" fill="url(#sunGlow)" />
+              <circle cx="680" cy="70" r="16" fill="#fef08a" />
+              <!-- Sun Rays -->
+              <line x1="680" y1="40" x2="680" y2="20" stroke="#fde047" stroke-width="2" stroke-linecap="round" />
+              <line x1="650" y1="70" x2="630" y2="70" stroke="#fde047" stroke-width="2" stroke-linecap="round" />
+              <line x1="710" y1="70" x2="730" y2="70" stroke="#fde047" stroke-width="2" stroke-linecap="round" />
+              <line x1="658" y1="48" x2="644" y2="34" stroke="#fde047" stroke-width="2" stroke-linecap="round" />
+            </g>
+
+            <!-- Top Level High/Mid Cloud Layer (Renders if upper clouds present) -->
+            <path id="upperCloudPath" d="M 0,30 Q 150,10 300,35 T 600,20 T 800,40 L 800,0 L 0,0 Z" fill="#475569" opacity="0.0" />
+
+            <!-- Boulder to Green Mountain Elevation Profile (Terrain SVG) -->
+            <!-- 5,300ft valley (y=350) sloping up to Chautauqua (y=260) to Green Mountain peak (y=90) -->
+            <path d="M 0,350 
+                     L 180,350 
+                     Q 280,330 350,270 
+                     L 450,220 
+                     Q 550,170 650,90 
+                     L 680,90 
+                     L 720,140 
+                     L 800,200 
+                     L 800,400 
+                     L 0,400 Z" 
+                  fill="url(#mountainGrad)" 
+                  stroke="#475569" 
+                  stroke-width="2" />
+
+            <!-- Dynamic Cloud / Fog Layer Deck -->
+            <!-- Height adjusted dynamically in JS -->
+            <rect id="fogRect" x="0" y="210" width="800" height="190" fill="url(#fogGrad)" filter="url(#blurFog)" class="fog-layer" opacity="0.95" />
+            <!-- Cloud Top Puff Path for realism -->
+            <path id="fogTopPuffs" d="M 0,210 Q 50,195 100,210 T 200,210 T 300,210 T 400,210 T 500,210 T 600,210 T 700,210 T 800,210 L 800,400 L 0,400 Z" fill="#f1f5f9" opacity="0.5" class="fog-layer" />
+
+            <!-- Capping Temperature Inversion Line (Red Curve) -->
+            <path id="tempInversionLine" d="M 40,340 Q 60,250 140,210 T 280,140 T 500,120" fill="none" stroke="#f43f5e" stroke-width="2.5" stroke-dasharray="5 5" opacity="0.8" />
+
+            <!-- Location Markers & Labels -->
+            <!-- Boulder City Marker -->
+            <circle cx="120" cy="350" r="5" fill="#06b6d4" />
+            <text x="100" y="375" fill="#94a3b8" font-size="11" font-weight="bold">Downtown Boulder</text>
+            <text x="120" y="390" fill="#64748b" font-size="10">5,300 ft</text>
+
+            <!-- Chautauqua / NCAR Marker -->
+            <circle cx="350" cy="270" r="4" fill="#38bdf8" />
+            <text x="325" y="255" fill="#cbd5e1" font-size="10" font-weight="semibold">NCAR / Chautauqua</text>
+
+            <!-- Green Mountain Summit Marker -->
+            <polygon points="680,80 673,95 687,95" fill="#f59e0b" />
+            <text x="620" y="65" fill="#fef08a" font-size="12" font-weight="extrabold">Green Mountain Summit</text>
+            <text x="660" y="80" fill="#f59e0b" font-size="10" font-weight="bold">8,144 ft</text>
+
+            <!-- Dynamic Breakout Height Indicator Line -->
+            <g id="breakoutLineGroup">
+              <line id="breakoutLine" x1="0" y1="210" x2="800" y2="210" stroke="#06b6d4" stroke-width="1.5" stroke-dasharray="3 3" />
+              <text id="breakoutText" x="480" y="202" fill="#38bdf8" font-size="11" font-weight="bold" font-family="JetBrains Mono">Estimated Cloud Top: ~6,800 ft</text>
+            </g>
+
+          </svg>
+
+        </div>
+
+        <!-- SVG Footer Info -->
+        <div class="flex items-center justify-between text-xs text-slate-400 px-1 pt-1">
+          <span class="flex items-center space-x-1">
+            <i class="fa-solid fa-circle-info text-cyan-400"></i>
+            <span>Diagram scales fog ceiling & high cloud deck in real-time.</span>
+          </span>
+          <span class="font-mono text-[11px] text-slate-400">Model: HRRR / GFS Blend</span>
+        </div>
+
+      </div>
+
+    </div>
+
+    <!-- METRIC BREAKDOWN CARDS (4 CARDS) -->
+    <section class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+      
+      <!-- Metric 1: Low Cloud Deck -->
+      <div class="glass-card glass-card-hover rounded-2xl p-5 flex flex-col justify-between">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">1. Low Cloud Deck</span>
+          <div class="p-2 rounded-lg bg-slate-800 text-cyan-400">
+            <i class="fa-solid fa-cloud"></i>
+          </div>
+        </div>
+        <div class="my-3">
+          <div class="flex items-baseline space-x-2">
+            <span id="metricLowClouds" class="text-3xl font-extrabold text-white font-mono">--%</span>
+            <span class="text-xs text-slate-400">target &ge; 70%</span>
+          </div>
+          <!-- Progress Bar -->
+          <div class="w-full bg-slate-800 h-2 rounded-full mt-3 overflow-hidden">
+            <div id="barLowClouds" class="bg-cyan-400 h-full rounded-full transition-all duration-500" style="width: 0%"></div>
+          </div>
+        </div>
+        <p class="text-xs text-slate-400" id="descLowClouds">Pulls moist air into lower valley floor.</p>
+      </div>
+
+      <!-- Metric 2: Summit Clear Skies -->
+      <div class="glass-card glass-card-hover rounded-2xl p-5 flex flex-col justify-between">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">2. Upper Sky Clearance</span>
+          <div class="p-2 rounded-lg bg-slate-800 text-amber-400">
+            <i class="fa-solid fa-sun"></i>
+          </div>
+        </div>
+        <div class="my-3">
+          <div class="flex items-baseline space-x-2">
+            <span id="metricClearSky" class="text-3xl font-extrabold text-white font-mono">--%</span>
+            <span class="text-xs text-slate-400">target &le; 35% mid/high</span>
+          </div>
+          <!-- Progress Bar -->
+          <div class="w-full bg-slate-800 h-2 rounded-full mt-3 overflow-hidden">
+            <div id="barClearSky" class="bg-amber-400 h-full rounded-full transition-all duration-500" style="width: 0%"></div>
+          </div>
+        </div>
+        <p class="text-xs text-slate-400" id="descClearSky">Ensures sunshine on Green Mt summit.</p>
+      </div>
+
+      <!-- Metric 3: Thermal Inversion Delta -->
+      <div class="glass-card glass-card-hover rounded-2xl p-5 flex flex-col justify-between">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">3. Vertical Temp Sounding</span>
+          <div class="p-2 rounded-lg bg-slate-800 text-rose-400">
+            <i class="fa-solid fa-temperature-arrow-up"></i>
+          </div>
+        </div>
+        <div class="my-3">
+          <div class="flex items-baseline space-x-2">
+            <span id="metricTempDelta" class="text-3xl font-extrabold text-white font-mono">--°C</span>
+            <span class="text-xs text-slate-400">750hPa vs Surface</span>
+          </div>
+          <div class="text-xs font-mono text-slate-300 mt-2 flex items-center justify-between">
+            <span>Surface: <span id="valSurfTemp">--°C</span></span>
+            <span>8,000ft: <span id="valHighTemp">--°C</span></span>
+          </div>
+        </div>
+        <p class="text-xs text-slate-400" id="descTempDelta">Warm cap traps cooler air in valley.</p>
+      </div>
+
+      <!-- Metric 4: Surface Wind Vector -->
+      <div class="glass-card glass-card-hover rounded-2xl p-5 flex flex-col justify-between">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">4. Surface Wind & Flow</span>
+          <div class="p-2 rounded-lg bg-slate-800 text-emerald-400">
+            <i class="fa-solid fa-wind"></i>
+          </div>
+        </div>
+        <div class="my-3">
+          <div class="flex items-center justify-between">
+            <span id="metricWindSpeed" class="text-3xl font-extrabold text-white font-mono">-- mph</span>
+            <div class="flex items-center space-x-1.5 bg-slate-900 px-2.5 py-1 rounded-lg border border-slate-700">
+              <i class="fa-solid fa-location-arrow transition-transform duration-500 text-emerald-400" id="windArrow"></i>
+              <span id="metricWindDir" class="text-xs font-bold text-slate-200">--</span>
+            </div>
+          </div>
+          <!-- Wind Quality Indicator -->
+          <div class="w-full bg-slate-800 h-2 rounded-full mt-3 overflow-hidden">
+            <div id="barWind" class="bg-emerald-400 h-full rounded-full transition-all duration-500" style="width: 0%"></div>
+          </div>
+        </div>
+        <p class="text-xs text-slate-400" id="descWind">Easterly/Upslope feeds moisture wall.</p>
+      </div>
+
+    </section>
+
+    <!-- HIKING ACTION PLAN & RECOMMENDATION SECTION -->
+    <section class="glass-card rounded-3xl p-6 relative overflow-hidden">
+      <div class="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 border-b border-slate-800 pb-5 mb-5">
+        <div class="flex items-center space-x-3">
+          <div class="w-12 h-12 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400 text-xl">
+            <i class="fa-solid fa-person-hiking"></i>
+          </div>
+          <div>
+            <h3 class="text-lg font-bold text-white">Night-Before Hiking & Photography Plan</h3>
+            <p class="text-xs text-slate-400">Customized recommendations for capturing sunrise above the cloud deck</p>
+          </div>
+        </div>
+
+        <!-- Alarm Recommendation Pill -->
+        <div class="flex items-center space-x-3 bg-slate-900/90 border border-slate-700/80 px-4 py-2 rounded-2xl">
+          <i class="fa-regular fa-clock text-amber-400 text-lg"></i>
+          <div>
+            <div class="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Recommended Alarm</div>
+            <div id="recAlarmTime" class="text-sm font-extrabold text-white font-mono">5:15 AM MDT</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 3 Recommendation Columns -->
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-6 text-sm">
+        
+        <!-- Trailhead Strategy -->
+        <div class="space-y-2">
+          <div class="flex items-center space-x-2 text-cyan-400 font-bold text-xs uppercase tracking-wider">
+            <i class="fa-solid fa-map-location-dot"></i>
+            <span>Trailhead Strategy</span>
+          </div>
+          <h4 id="recTrailheadTitle" class="font-bold text-slate-100 text-base">Gregory Canyon / Realization Pt</h4>
+          <p id="recTrailheadDesc" class="text-xs text-slate-300 leading-relaxed">
+            Start at Chautauqua or drive Flagstaff Road to Realization Point (7,200') to hit cloud breakout fast.
+          </p>
+        </div>
+
+        <!-- Breakout Altitude Target -->
+        <div class="space-y-2">
+          <div class="flex items-center space-x-2 text-emerald-400 font-bold text-xs uppercase tracking-wider">
+            <i class="fa-solid fa-layer-group"></i>
+            <span>Breakout Altitude Target</span>
+          </div>
+          <h4 id="recBreakoutTitle" class="font-bold text-slate-100 text-base">Breakout at ~6,600 ft</h4>
+          <p id="recBreakoutDesc" class="text-xs text-slate-300 leading-relaxed">
+            Expect thick fog deck through Chautauqua Meadows; blue sky and full sunshine emerge above NCAR level.
+          </p>
+        </div>
+
+        <!-- Recommended Gear & Camera Advice -->
+        <div class="space-y-2">
+          <div class="flex items-center space-x-2 text-amber-400 font-bold text-xs uppercase tracking-wider">
+            <i class="fa-solid fa-camera font-bold"></i>
+            <span>Gear & Photography Tips</span>
+          </div>
+          <h4 id="recGearTitle" class="font-bold text-slate-100 text-base">High-Contrast Lighting Pack</h4>
+          <p id="recGearDesc" class="text-xs text-slate-300 leading-relaxed">
+            Bring headlamp for the damp lower trail. Summit will be warmer and dry; pack ND filter for sunrise over sea of clouds.
+          </p>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- 7-DAY INVERSION OUTLOOK FORECAST STRIP -->
+    <section class="glass-card rounded-3xl p-6 space-y-4">
+      <div class="flex items-center justify-between">
+        <div>
+          <span class="text-xs font-bold tracking-widest text-cyan-400 uppercase">Extended Outlook</span>
+          <h3 class="text-lg font-extrabold text-white">7-Day Inversion Probability Forecast</h3>
+        </div>
+        <span class="text-xs text-slate-400">Evaluates daily 6-9 AM MDT window</span>
+      </div>
+
+      <!-- Scrollable 7-day Strip -->
+      <div id="forecastStrip" class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3 pt-2">
+        <!-- JS dynamically populates 7 day cards here -->
+        <div class="text-center py-6 text-slate-500 col-span-full">Loading 7-day atmospheric outlook...</div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- FOOTER -->
+  <footer class="border-t border-slate-800/80 bg-slate-950 py-6 mt-8">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-500">
+      <div class="flex items-center space-x-2">
+        <span>© Boulder Inversion Tracker & Predictor</span>
+        <span>•</span>
+        <span>Open-Meteo Atmospheric Sounding Engine</span>
+      </div>
+      <div class="flex items-center space-x-4">
+        <span>Green Mountain Summit: 8,144 ft</span>
+        <span>Boulder Airport: 5,288 ft</span>
+      </div>
+    </div>
+  </footer>
+
+  <!-- APPLICATION LOGIC & DATA ENGINE -->
+  <script>
+    /**
+     * Atmospheric Model Parameters & Configuration
+     * Open-Meteo API endpoint for Boulder, CO (40.0150, -105.2705)
+     */
+    const BOULDER_LAT = 40.0150;
+    const BOULDER_LON = -105.2705;
+    
+    // Store active data state
+    let activeState = {
+      isLive: true,
+      currentData: null,
+      forecastDays: []
+    };
+
+    /**
+     * Scenario Presets Data for instant testing
+     */
+    const PRESETS = {
+      epic: {
+        name: "Classic Epic Inversion",
+        lowClouds: 96,
+        midClouds: 10,
+        highClouds: 5,
+        surfTemp: 2.5,
+        dewPoint: 2.0,
+        rh: 96,
+        temp750: 7.5, // Warm cap (+5°C warmer aloft!)
+        windSpeed: 4.2,
+        windDir: 80, // Easterly
+        calcScore: 94
+      },
+      socked: {
+        name: "Deep Fog Deck (Socked In)",
+        lowClouds: 100,
+        midClouds: 85,
+        highClouds: 75,
+        surfTemp: 1.0,
+        dewPoint: 0.5,
+        rh: 95,
+        temp750: -3.0, // Deep cold moisture layer > 10,000 ft
+        windSpeed: 7.0,
+        windDir: 60,
+        calcScore: 32
+      },
+      clear: {
+        name: "Bluebird Sky (No Fog)",
+        lowClouds: 5,
+        midClouds: 0,
+        highClouds: 0,
+        surfTemp: 14.0,
+        dewPoint: -2.0,
+        rh: 32,
+        temp750: 5.0,
+        windSpeed: 5.5,
+        windDir: 180,
+        calcScore: 8
+      },
+      chinook: {
+        name: "Downslope Chinook Windstorm",
+        lowClouds: 10,
+        midClouds: 25,
+        highClouds: 40,
+        surfTemp: 17.5,
+        dewPoint: -6.0,
+        rh: 19,
+        temp750: 3.0,
+        windSpeed: 28.0, // Westerly gale scouring moisture out
+        windDir: 270,
+        calcScore: 2
+      }
+    };
+
+    /**
+     * Main Initialization on Window Load
+     */
+    window.onload = function() {
+      fetchWeatherData();
+    };
+
+    /**
+     * Fetch Weather Data from Open-Meteo API
+     */
+    async function fetchWeatherData() {
+      const refreshIcon = document.getElementById('refreshIcon');
+      refreshIcon.classList.add('fa-spin');
+      
+      const apiUrl = `https://api.open-meteo.com/v1/forecast?latitude=${BOULDER_LAT}&longitude=${BOULDER_LON}&hourly=temperature_2m,dew_point_2m,relative_humidity_2m,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,wind_speed_10m,wind_direction_10m,temperature_850hPa,temperature_750hPa&timezone=America%2FDenver`;
+
+      try {
+        const response = await fetch(apiUrl);
+        if (!response.ok) throw new Error("Weather API Response Error");
+        const data = await response.json();
+        
+        activeState.isLive = true;
+        activeState.currentData = data;
+        
+        // Update UI buttons state
+        setActivePresetButton('live');
+
+        // Process Tomorrow Morning Data Window (6 AM - 9 AM)
+        processTomorrowForecast(data);
+        
+        // Process 7-day outlook
+        processSevenDayOutlook(data);
+
+        document.getElementById('apiStatusText').textContent = "Open-Meteo Synced";
+        document.getElementById('statusBadge').classList.remove('hidden');
+
+      } catch (err) {
+        console.warn("API Fetch Failed, loading fallback synthetic live data...", err);
+        document.getElementById('apiStatusText').textContent = "Live Sim Mode";
+        // Fallback to epic preset as simulated live data
+        loadPreset('epic');
+      } finally {
+        refreshIcon.classList.remove('fa-spin');
+      }
+    }
+
+    /**
+     * Process tomorrow's 6:00 AM - 9:00 AM forecast hours from Open-Meteo payload
+     */
+    function processTomorrowForecast(data) {
+      const hourly = data.hourly;
+      if (!hourly || !hourly.time) return;
+
+      // Find indices for tomorrow morning 6:00 to 9:00 AM MDT
+      // Time format: "2026-10-28T06:00"
+      const now = new Date();
+      const tomorrow = new Date(now);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      const tomorrowStr = tomorrow.toISOString().split('T')[0]; // YYYY-MM-DD
+
+      let indices = [];
+      for (let i = 0; i < hourly.time.length; i++) {
+        if (hourly.time[i].startsWith(tomorrowStr)) {
+          const hour = parseInt(hourly.time[i].split('T')[1].split(':')[0]);
+          if (hour >= 6 && hour <= 9) {
+            indices.push(i);
+          }
+        }
+      }
+
+      // If tomorrow indices not found (e.g., late night edge), take indices 6-9 of day 2
+      if (indices.length === 0) {
+        indices = [6, 7, 8, 9];
+      }
+
+      // Compute average metrics for 6-9 AM window
+      const avg = (arr) => indices.reduce((sum, idx) => sum + (arr[idx] || 0), 0) / indices.length;
+
+      const metrics = {
+        name: "Tomorrow Live Forecast",
+        lowClouds: Math.round(avg(hourly.cloud_cover_low)),
+        midClouds: Math.round(avg(hourly.cloud_cover_mid)),
+        highClouds: Math.round(avg(hourly.cloud_cover_high)),
+        surfTemp: parseFloat(avg(hourly.temperature_2m).toFixed(1)),
+        dewPoint: parseFloat(avg(hourly.dew_point_2m).toFixed(1)),
+        rh: Math.round(avg(hourly.relative_humidity_2m)),
+        temp750: parseFloat(avg(hourly.temperature_750hPa).toFixed(1)),
+        windSpeed: Math.round(avg(hourly.wind_speed_10m)),
+        windDir: Math.round(avg(hourly.wind_direction_10m))
+      };
+
+      // Set target date text
+      const dateOptions = { weekday: 'short', month: 'short', day: 'numeric' };
+      document.getElementById('targetDateText').textContent = `${tomorrow.toLocaleDateString('en-US', dateOptions)} • 6-9 AM`;
+
+      evaluateAndRenderUI(metrics);
+    }
+
+    /**
+     * Inversion Algorithm & Scoring Engine
+     * Evaluates 5 core atmospheric criteria for Boulder Flatirons Cloud Inversion
+     */
+    function calculateInversionScore(m) {
+      let score = 0;
+
+      // Criterion A: Low Cloud Deck (Trapped moisture in valley) [Max 30 pts]
+      // Target: >= 70% low clouds
+      let lowCloudScore = 0;
+      if (m.lowClouds >= 70) {
+        lowCloudScore = 30;
+      } else {
+        lowCloudScore = (m.lowClouds / 70) * 30;
+      }
+      score += lowCloudScore;
+
+      // Criterion B: Summit Clear Skies (Upper sky clear for sun) [Max 25 pts]
+      // Target: (mid + high clouds)/2 <= 35%
+      const avgUpperCloud = (m.midClouds + m.highClouds) / 2;
+      let upperClearScore = 0;
+      if (avgUpperCloud <= 35) {
+        upperClearScore = 25;
+      } else {
+        upperClearScore = Math.max(0, 25 - ((avgUpperCloud - 35) * 0.38));
+      }
+      score += upperClearScore;
+
+      // Criterion C: Temperature Inversion Cap [Max 25 pts]
+      // Temp at 750hPa (~8000ft Green Mt) >= Surface Temp 2m
+      const tempDelta = m.temp750 - m.surfTemp; // positive means warmer aloft!
+      let tempCapScore = 0;
+      if (tempDelta > 0) {
+        tempCapScore = Math.min(25, 15 + (tempDelta * 2));
+      } else if (tempDelta > -2.0) { // Slight lapse rate still allows shallow inversion
+        tempCapScore = 8;
+      } else {
+        tempCapScore = 0;
+      }
+      score += tempCapScore;
+
+      // Criterion D: Surface Moisture Saturation [Max 10 pts]
+      // (Temp - Dewpoint) <= 2°C or RH >= 88%
+      const spread = m.surfTemp - m.dewPoint;
+      let moistureScore = 0;
+      if (spread <= 1.5 || m.rh >= 90) {
+        moistureScore = 10;
+      } else if (spread <= 3.0 || m.rh >= 80) {
+        moistureScore = 6;
+      }
+      score += moistureScore;
+
+      // Criterion E: Wind Vector & Upslope Dynamics [Max 10 pts]
+      // Ideal: Light Easterly (40° - 140°), < 10mph
+      let windScore = 0;
+      const isEasterly = (m.windDir >= 40 && m.windDir <= 140);
+      const isWesterlyDownslope = (m.windDir >= 220 && m.windDir <= 320);
+
+      if (isEasterly && m.windSpeed <= 10) {
+        windScore = 10;
+      } else if (m.windSpeed <= 8 && !isWesterlyDownslope) {
+        windScore = 7;
+      } else if (isWesterlyDownslope && m.windSpeed > 12) {
+        // Downslope Chinook penalty
+        windScore = -15;
+      }
+      score += windScore;
+
+      // Clamp overall score 0 - 100
+      return Math.min(100, Math.max(0, Math.round(score)));
+    }
+
+    /**
+     * Render main dashboard UI elements based on metrics & calculated score
+     */
+    function evaluateAndRenderUI(m) {
+      const score = m.calcScore !== undefined ? m.calcScore : calculateInversionScore(m);
+      
+      // 1. Update Percentage & Gauge Arc
+      const probPercent = document.getElementById('probPercent');
+      const gaugeArc = document.getElementById('gaugeArc');
+      
+      probPercent.textContent = `${score}%`;
+      
+      // Total SVG circumference = 2 * PI * 50 = 314.15
+      const circumference = 314.15;
+      const strokeOffset = circumference - (score / 100) * circumference;
+      gaugeArc.style.strokeDashoffset = strokeOffset;
+
+      // Gauge Color & Category Badge Logic
+      const badge = document.getElementById('probCategory');
+      const verdictTitle = document.getElementById('verdictTitle');
+      const verdictDesc = document.getElementById('verdictDesc');
+      const verdictIcon = document.getElementById('verdictIcon');
+      const verdictContainer = document.getElementById('verdictIconContainer');
+
+      if (score >= 80) {
+        gaugeArc.setAttribute('class', 'gauge-circle stroke-emerald-400');
+        badge.textContent = "EPIC INVERSION GUARANTEED!";
+        badge.className = "text-xs font-bold uppercase tracking-wider text-emerald-400 mt-1 px-3 py-1 bg-emerald-950/80 rounded-full border border-emerald-700/60";
+        
+        verdictTitle.textContent = "Sea of Clouds Over Boulder Valley!";
+        verdictDesc.textContent = "High confidence! Boulder will be buried in fog while Green Mountain summit (8,144') sits in bright warm sunshine above the deck.";
+        verdictIcon.className = "fa-solid fa-cloud-sun text-emerald-400";
+        verdictContainer.className = "p-2.5 rounded-xl bg-emerald-950 text-emerald-400 text-lg flex-shrink-0";
+      } else if (score >= 55) {
+        gaugeArc.setAttribute('class', 'gauge-circle stroke-cyan-400');
+        badge.textContent = "HIGH PROBABILITY";
+        badge.className = "text-xs font-bold uppercase tracking-wider text-cyan-400 mt-1 px-3 py-1 bg-cyan-950/80 rounded-full border border-cyan-700/60";
+
+        verdictTitle.textContent = "Favorable Inversion Setup";
+        verdictDesc.textContent = "Good low cloud deck expected in the valley. Breakout altitude likely around 6,400 - 7,000 ft near Gregory Canyon.";
+        verdictIcon.className = "fa-solid fa-mountain text-cyan-400";
+        verdictContainer.className = "p-2.5 rounded-xl bg-cyan-950 text-cyan-400 text-lg flex-shrink-0";
+      } else if (score >= 30) {
+        gaugeArc.setAttribute('class', 'gauge-circle stroke-amber-400');
+        badge.textContent = "MODERATE / MARGINAL";
+        badge.className = "text-xs font-bold uppercase tracking-wider text-amber-400 mt-1 px-3 py-1 bg-amber-950/80 rounded-full border border-amber-700/60";
+
+        verdictTitle.textContent = "Marginal Cloud Ceiling";
+        verdictDesc.textContent = "Cloud deck may be too thick/deep or patchy. Green Mountain summit may brief in and out of fog.";
+        verdictIcon.className = "fa-solid fa-smog text-amber-400";
+        verdictContainer.className = "p-2.5 rounded-xl bg-amber-950 text-amber-400 text-lg flex-shrink-0";
+      } else {
+        gaugeArc.setAttribute('class', 'gauge-circle stroke-rose-400');
+        badge.textContent = "UNLIKELY / NO INVERSION";
+        badge.className = "text-xs font-bold uppercase tracking-wider text-rose-400 mt-1 px-3 py-1 bg-rose-950/80 rounded-full border border-rose-700/60";
+
+        verdictTitle.textContent = "No Cloud Inversion Expected";
+        verdictDesc.textContent = m.windSpeed > 15 ? 
+          "Strong downslope Chinook winds blowing out moisture." : 
+          "Clear bluebird skies across both valley and peaks, or overcast at all altitudes.";
+        verdictIcon.className = "fa-solid fa-sun text-rose-400";
+        verdictContainer.className = "p-2.5 rounded-xl bg-rose-950 text-rose-400 text-lg flex-shrink-0";
+      }
+
+      // 2. Update Metric Cards
+      document.getElementById('metricLowClouds').textContent = `${m.lowClouds}%`;
+      document.getElementById('barLowClouds').style.width = `${m.lowClouds}%`;
+
+      const upperClearVal = Math.max(0, Math.round(100 - (m.midClouds + m.highClouds)/2));
+      document.getElementById('metricClearSky').textContent = `${upperClearVal}%`;
+      document.getElementById('barClearSky').style.width = `${upperClearVal}%`;
+
+      const delta = (m.temp750 - m.surfTemp).toFixed(1);
+      document.getElementById('metricTempDelta').textContent = `${delta > 0 ? '+' : ''}${delta}°C`;
+      document.getElementById('valSurfTemp').textContent = `${m.surfTemp}°C`;
+      document.getElementById('valHighTemp').textContent = `${m.temp750}°C`;
+
+      document.getElementById('metricWindSpeed').textContent = `${m.windSpeed} mph`;
+      document.getElementById('metricWindDir').textContent = getWindDirectionAbbr(m.windDir);
+      document.getElementById('windArrow').style.transform = `rotate(${m.windDir}deg)`;
+      
+      const windQuality = (m.windDir >= 40 && m.windDir <= 140) ? Math.min(100, (15 - m.windSpeed) * 8) : 25;
+      document.getElementById('barWind').style.width = `${Math.max(10, windQuality)}%`;
+
+      // 3. Update Interactive SVG Mountain Diagram
+      updateSVGDiagram(m, score);
+
+      // 4. Update Hiking Recommendations
+      updateHikingPlan(m, score);
+    }
+
+    /**
+     * Dynamically adjust SVG elements (fog height, sun, clouds, breakout line)
+     */
+    function updateSVGDiagram(m, score) {
+      const fogRect = document.getElementById('fogRect');
+      const fogPuffs = document.getElementById('fogTopPuffs');
+      const upperCloudPath = document.getElementById('upperCloudPath');
+      const breakoutLineGroup = document.getElementById('breakoutLineGroup');
+      const breakoutText = document.getElementById('breakoutText');
+      const breakoutLine = document.getElementById('breakoutLine');
+
+      // Map low cloud percentage & temperature to Fog Y position
+      // Y=350 (Valley Floor 5300ft), Y=90 (Green Mt Peak 8144ft)
+      let fogY = 350;
+      let opacity = (m.lowClouds / 100) * 0.9;
+
+      if (m.lowClouds < 15) {
+        // No fog deck
+        opacity = 0.0;
+        fogY = 380;
+      } else {
+        // Compute cloud breakout altitude based on thermal cap delta
+        // Average inversion deck height ranges from 6,200ft to 7,400ft
+        const tempDelta = m.temp750 - m.surfTemp;
+        if (tempDelta > 2) {
+          fogY = 220; // ~6,600 ft MSL (Below Green Mt Summit)
+        } else if (tempDelta < -1) {
+          fogY = 130; // ~7,800 ft (Socked in deep)
+        } else {
+          fogY = 180; // ~7,100 ft
+        }
+      }
+
+      // Update fog position & opacity
+      fogRect.setAttribute('y', fogY);
+      fogRect.setAttribute('height', 400 - fogY);
+      fogRect.setAttribute('opacity', opacity);
+
+      fogPuffs.setAttribute('d', `M 0,${fogY} Q 50,${fogY-15} 100,${fogY} T 200,${fogY} T 300,${fogY} T 400,${fogY} T 500,${fogY} T 600,${fogY} T 700,${fogY} T 800,${fogY} L 800,400 L 0,400 Z`);
+      fogPuffs.setAttribute('opacity', opacity > 0 ? 0.6 : 0);
+
+      // Upper Cloud Layer (Mid/High clouds opacity)
+      const avgUpperCloud = (m.midClouds + m.highClouds) / 2;
+      upperCloudPath.setAttribute('opacity', (avgUpperCloud / 100) * 0.85);
+
+      // Breakout Text & Line
+      if (opacity > 0.1 && fogY > 100) {
+        breakoutLineGroup.style.display = 'block';
+        breakoutLine.setAttribute('y1', fogY);
+        breakoutLine.setAttribute('y2', fogY);
+        
+        // Convert SVG Y coordinate back to estimated altitude display
+        const estAlt = Math.round(5300 + ((350 - fogY) / 260) * 2844);
+        breakoutText.setAttribute('y', fogY - 8);
+        
+        if (estAlt < 8100) {
+          breakoutText.textContent = `Estimated Cloud Top: ~${estAlt.toLocaleString()} ft (Summit Above Clouds!)`;
+          breakoutText.setAttribute('fill', '#38bdf8');
+        } else {
+          breakoutText.textContent = `Estimated Cloud Top: >8,200 ft (Peaks Socked In)`;
+          breakoutText.setAttribute('fill', '#f43f5e');
+        }
+      } else {
+        breakoutLineGroup.style.display = 'none';
+      }
+    }
+
+    /**
+     * Update Hiking & Photography Recommendation Box
+     */
+    function updateHikingPlan(m, score) {
+      const alarm = document.getElementById('recAlarmTime');
+      const thTitle = document.getElementById('recTrailheadTitle');
+      const thDesc = document.getElementById('recTrailheadDesc');
+      const boTitle = document.getElementById('recBreakoutTitle');
+      const boDesc = document.getElementById('recBreakoutDesc');
+      const gearTitle = document.getElementById('recGearTitle');
+      const gearDesc = document.getElementById('recGearDesc');
+
+      if (score >= 70) {
+        alarm.textContent = "5:15 AM MDT";
+        thTitle.textContent = "Gregory Canyon & Realization Pt";
+        thDesc.textContent = "Hike Green Mountain Trail via Gregory Canyon or park at Realization Point (7,200') to hit the sunny cloud ceiling quickly.";
+        
+        boTitle.textContent = "Breakout Altitude: ~6,600 ft";
+        boDesc.textContent = "You will hike through chilly dense fog at Chautauqua Meadows before breaking out into brilliant sunshine near Panther Canyon.";
+        
+        gearTitle.textContent = "Golden Hour & Cloud-Sea Pack";
+        gearDesc.textContent = "Bring headlamp for fog trail, sunglasses for bright summit sun, and camera tripod. Summit will be up to 10°F warmer than the foggy valley!";
+      } else if (score >= 40) {
+        alarm.textContent = "5:45 AM MDT";
+        thTitle.textContent = "Chautauqua Trailhead";
+        thDesc.textContent = "Start at Chautauqua Ranger Cottage. Cloud tops are higher today, so climb all the way to Green Mountain summit (8,144').";
+        
+        boTitle.textContent = "Breakout Altitude: ~7,500 ft";
+        boDesc.textContent = "Variable cloud ceiling. Expect high stratus layer hugging the Flatirons base with sporadic openings.";
+        
+        gearTitle.textContent = "Moisture & Wind Layering";
+        gearDesc.textContent = "Pack waterproof shell for damp low elevation trail, plus warm mid-layer for ridge breeze.";
+      } else {
+        alarm.textContent = "Sleep In / 7:30 AM";
+        thTitle.textContent = "Standard Day Hike";
+        thDesc.textContent = "Inversion conditions unlikely. Clear views or uniform overcast expected across both valley and peaks.";
+        
+        boTitle.textContent = "No Breakout Layer";
+        boDesc.textContent = "Atmosphere is well-mixed without a shallow capping inversion trapped in Boulder basin.";
+        
+        gearTitle.textContent = "Standard Trail Essentials";
+        gearDesc.textContent = "Standard daylight hiking gear. Check wind advisory if strong westerly Chinook winds are present.";
+      }
+    }
+
+    /**
+     * Process 7-Day Forecast Strip from Open-Meteo
+     */
+    function processSevenDayOutlook(data) {
+      const forecastStrip = document.getElementById('forecastStrip');
+      forecastStrip.innerHTML = '';
+
+      const hourly = data.hourly;
+      if (!hourly || !hourly.time) return;
+
+      // Group hourly indices by Date String (YYYY-MM-DD)
+      const dailyMap = {};
+      
+      for (let i = 0; i < hourly.time.length; i++) {
+        const dateStr = hourly.time[i].split('T')[0];
+        const hour = parseInt(hourly.time[i].split('T')[1].split(':')[0]);
+        
+        if (!dailyMap[dateStr]) {
+          dailyMap[dateStr] = [];
+        }
+        
+        // Collect morning hours 6-9 AM for each day
+        if (hour >= 6 && hour <= 9) {
+          dailyMap[dateStr].push(i);
+        }
+      }
+
+      const dateKeys = Object.keys(dailyMap).slice(0, 7);
+
+      dateKeys.forEach((dateStr, idx) => {
+        const indices = dailyMap[dateStr];
+        if (indices.length === 0) return;
+
+        const avg = (arr) => indices.reduce((sum, i) => sum + (arr[i] || 0), 0) / indices.length;
+
+        const dayMetrics = {
+          lowClouds: Math.round(avg(hourly.cloud_cover_low)),
+          midClouds: Math.round(avg(hourly.cloud_cover_mid)),
+          highClouds: Math.round(avg(hourly.cloud_cover_high)),
+          surfTemp: parseFloat(avg(hourly.temperature_2m).toFixed(1)),
+          dewPoint: parseFloat(avg(hourly.dew_point_2m).toFixed(1)),
+          rh: Math.round(avg(hourly.relative_humidity_2m)),
+          temp750: parseFloat(avg(hourly.temperature_750hPa).toFixed(1)),
+          windSpeed: Math.round(avg(hourly.wind_speed_10m)),
+          windDir: Math.round(avg(hourly.wind_direction_10m))
+        };
+
+        const dayScore = calculateInversionScore(dayMetrics);
+        const dateObj = new Date(dateStr + 'T06:00:00');
+        const dayName = idx === 0 ? 'Today' : idx === 1 ? 'Tomorrow' : dateObj.toLocaleDateString('en-US', { weekday: 'short' });
+        const dateFormatted = dateObj.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric' });
+
+        // Score color pill
+        let scoreClass = "bg-rose-950/60 text-rose-400 border-rose-800/40";
+        let iconClass = "fa-sun text-amber-400";
+        if (dayScore >= 75) {
+          scoreClass = "bg-emerald-950/80 text-emerald-300 border-emerald-700/60";
+          iconClass = "fa-cloud-sun text-emerald-400";
+        } else if (dayScore >= 45) {
+          scoreClass = "bg-cyan-950/80 text-cyan-300 border-cyan-700/60";
+          iconClass = "fa-smog text-cyan-400";
+        }
+
+        const cardHtml = `
+          <div class="bg-slate-900/80 border border-slate-800 rounded-2xl p-3 flex flex-col justify-between items-center text-center hover:border-cyan-700/50 transition">
+            <div>
+              <div class="text-xs font-bold text-slate-200">${dayName}</div>
+              <div class="text-[10px] text-slate-400 font-mono">${dateFormatted}</div>
+            </div>
+
+            <div class="my-3 flex flex-col items-center">
+              <i class="fa-solid ${iconClass} text-xl my-1"></i>
+              <span class="text-xl font-black font-mono text-white">${dayScore}%</span>
+            </div>
+
+            <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border ${scoreClass} w-full truncate">
+              ${dayScore >= 75 ? 'Epic' : dayScore >= 45 ? 'Moderate' : 'Unlikely'}
+            </span>
+          </div>
+        `;
+
+        forecastStrip.innerHTML += cardHtml;
+      });
+    }
+
+    /**
+     * Load Preset Scenario for instant testing
+     */
+    function loadPreset(presetKey) {
+      setActivePresetButton(presetKey);
+
+      if (presetKey === 'live') {
+        if (activeState.currentData) {
+          processTomorrowForecast(activeState.currentData);
+        } else {
+          fetchWeatherData();
+        }
+        return;
+      }
+
+      const presetData = PRESETS[presetKey];
+      if (presetData) {
+        evaluateAndRenderUI(presetData);
+      }
+    }
+
+    /**
+     * Helper to style active scenario preset button
+     */
+    function setActivePresetButton(activeKey) {
+      const buttons = document.querySelectorAll('.preset-btn');
+      buttons.forEach(btn => {
+        btn.className = "preset-btn px-3 py-1.5 rounded-xl font-medium border border-slate-700 bg-slate-900 text-slate-300 hover:border-slate-500 transition";
+      });
+
+      const activeBtn = document.getElementById(`btn-${activeKey}`);
+      if (activeBtn) {
+        activeBtn.className = "preset-btn px-3 py-1.5 rounded-xl font-medium border border-cyan-500 bg-cyan-950/80 text-cyan-300 shadow-sm transition";
+      }
+    }
+
+    /**
+     * Helper to convert wind degrees to cardinal direction abbreviation
+     */
+    function getWindDirectionAbbr(deg) {
+      const dirs = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+      const val = Math.floor((deg / 22.5) + 0.5);
+      return dirs[val % 16];
+    }
+  </script>
+</body>
+</html>
