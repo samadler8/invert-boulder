@@ -1,0 +1,21 @@
+# Operating System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor & IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Web & Build artifacts (if using local bundlers in the future)
+node_modules/
+dist/
+.env
+.env.local
+*.log

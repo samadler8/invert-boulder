@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>User Guide | Boulder Inversion Tracker</title>
+  
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            alpine: { 900: '#080c14', 800: '#0f172a', 700: '#1e293b', 600: '#334155', cyan: '#06b6d4' }
+          },
+          fontFamily: {
+            sans: ['Inter', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace'],
+          }
+        }
+      }
+    }
+  </script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    body { font-family: 'Inter', sans-serif; background-color: #060911; color: #f8fafc; }
+    .glass-card { background: rgba(15, 23, 42, 0.78); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0b1120; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+  </style>
+</head>
+<body class="min-h-screen text-slate-100 flex flex-col justify-between selection:bg-cyan-500 selection:text-slate-950">
+
+  <!-- TOP HEADER -->
+  <header class="border-b border-slate-800/80 bg-slate-950/90 sticky top-0 z-50 backdrop-blur-md">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+      <div class="flex items-center space-x-3">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-cyan-600 to-amber-500 flex items-center justify-center">
+          <i class="fa-solid fa-book-open text-slate-950 text-xl font-bold"></i>
+        </div>
+        <div>
+          <h1 class="font-extrabold text-lg bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">User Guide</h1>
+          <p class="text-xs text-slate-400">How to navigate the predictor</p>
+        </div>
+      </div>
+      <!-- Navigation Links -->
+      <nav class="flex space-x-4 text-sm font-semibold">
+        <a href="index.html" class="text-slate-400 hover:text-cyan-400 transition"><i class="fa-solid fa-chart-line mr-1"></i>Dashboard</a>
+        <a href="guide.html" class="text-cyan-400"><i class="fa-solid fa-book-open mr-1"></i>Guide</a>
+        <a href="science.html" class="text-slate-400 hover:text-cyan-400 transition"><i class="fa-solid fa-flask mr-1"></i>Science</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="max-w-4xl mx-auto px-4 py-8 space-y-8 flex-grow">
+    
+    <section class="glass-card rounded-3xl p-8">
+      <h2 class="text-2xl font-extrabold text-white mb-4 border-b border-slate-700 pb-2">What is this Dashboard?</h2>
+      <p class="text-slate-300 leading-relaxed mb-4">
+        The Boulder Inversion Tracker is a highly specialized meteorological tool designed for photographers, hikers, and weather enthusiasts in Boulder, Colorado. It predicts the exact probability and elevation of temperature inversions—the phenomenon that traps the city in a dense fog deck while upper elevations sit under clear blue skies[cite: 3].
+      </p>
+      <p class="text-slate-300 leading-relaxed">
+        The dashboard uses a 3-level elevation profile comparing the <strong>City of Boulder (5,400 ft)</strong>, the <strong>1st Flatiron (7,200 ft)</strong>, and the <strong>Green Mountain Summit (8,100 ft)</strong> to determine which locations will be above the clouds[cite: 3].
+      </p>
+    </section>
+
+    <section class="glass-card rounded-3xl p-8">
+      <h2 class="text-2xl font-extrabold text-white mb-4 border-b border-slate-700 pb-2">Understanding the Terminology (Presets)</h2>
+      <ul class="space-y-4 text-slate-300">
+        <li><strong class="text-cyan-400"><i class="fa-solid fa-satellite-dish mr-2"></i>Live Forecast:</strong> Pulls real-time atmospheric sounding data to give you the current 7-day outlook[cite: 3].</li>
+        <li><strong class="text-emerald-400"><i class="fa-solid fa-trophy mr-2"></i>Classic Inversion:</strong> The "holy grail" setup. The cloud ceiling stops around 6,700 ft. The city is foggy, but if you hike to the 1st Flatiron or Green Mountain, you will break through the clouds into the sunshine[cite: 3].</li>
+        <li><strong class="text-amber-400"><i class="fa-solid fa-cloud mr-2"></i>High Deck:</strong> A deeper moisture layer. The fog ceiling rises to around 7,500 ft. The 1st Flatiron is stuck in the fog, and only the very top of Green Mountain sits above the clouds[cite: 3].</li>
+        <li><strong class="text-blue-400"><i class="fa-solid fa-smog mr-2"></i>Socked In:</strong> The moisture layer is very deep (above 8,100 ft). All three landmarks (City, Flatiron, Green Mountain) are trapped inside the cloud layer[cite: 3].</li>
+        <li><strong class="text-rose-400"><i class="fa-solid fa-sun mr-2"></i>Bluebird / Downslope:</strong> No inversion exists. The air is either very dry, or strong westerly winds (Chinooks) have blown the moisture away, resulting in clear air everywhere[cite: 3].</li>
+      </ul>
+    </section>
+
+    <section class="glass-card rounded-3xl p-8">
+      <h2 class="text-2xl font-extrabold text-white mb-4 border-b border-slate-700 pb-2">How to Use the Interactive Charts</h2>
+      <div class="space-y-6">
+        <div>
+          <h3 class="text-lg font-bold text-emerald-300 mb-2">1. The 3D Elevation Cross-Section</h3>
+          <p class="text-slate-300 text-sm">
+            This diagram visually maps the estimated cloud top against Boulder's terrain. It features dynamic tags that tell you whether each of the 3 landmarks is currently <strong>☁️ IN FOG</strong> or <strong>☀️ ABOVE CLOUDS</strong>[cite: 3]. When inversion probability drops below 20%, the fog disappears and a yellow "Clear Mountain Air" banner displays[cite: 3].
+          </p>
+        </div>
+        <div>
+          <h3 class="text-lg font-bold text-cyan-300 mb-2">2. The 7-Day Interactive Strip</h3>
+          <p class="text-slate-300 text-sm">
+            Click on any day in the 7-day strip. Doing so will recalculate the entire page for that specific day's peak inversion window, updating the gauge, metrics, and diagrams[cite: 3].
+          </p>
+        </div>
+        <div>
+          <h3 class="text-lg font-bold text-amber-300 mb-2">3. The 24-Hour Diurnal Timeline</h3>
+          <p class="text-slate-300 text-sm">
+            Located below the 7-day outlook, this chart lets you scrub through the day hour-by-hour. You can toggle between viewing the <strong>Inversion Probability (%)</strong> and the estimated <strong>Cloud Top Elevation (ft)</strong>[cite: 3]. Click on any bar in this chart, and the 3D Elevation Cross-Section above will instantly animate to show the conditions for that exact hour[cite: 3].
+          </p>
+        </div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
