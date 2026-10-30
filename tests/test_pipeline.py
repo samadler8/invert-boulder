@@ -1,112 +1,117 @@
-"""Only synthetic/weather-API-shaped fixtures; NO real forecast skill claims."""
-import math
-from datetime import datetime, timedelta, timezone
-
+"""Offline HRRR feature/model tests. These are synthetic fixtures, not real weather."""
+from datetime import datetime,timedelta,timezone,date
 import numpy as np
+from pathlib import Path
+import json
 import pytest
-from fastapi.testclient import TestClient
-
-from inversion.config import HOURLY_FIELDS, PRESSURE_LEVELS
-from inversion.features import row_at, rows_from_data, proxy_label, uv
-from inversion.train import train, split_chronological
+from inversion.hrrr import build_row,historical_pairs,load_jsonl,write_jsonl
+from inversion.config import FEATURE_NAMES, PROFILE_CHANNELS,MAX_LEAD_HOURS
+from inversion.observations import classify_low_ceiling, parse_iem_csv, save_csv, read_csv
+from inversion.hrrr_train import run_training, rows_and_labels, positive_days
 from inversion.predict import Predictor
-from inversion.server import app
 
 
-def fixture_response(n=600):
-    initial = datetime(2025, 1, 1, tzinfo=timezone.utc)
-    h = {'time': [(initial + timedelta(hours=i)).strftime('%Y-%m-%dT%H:%M') for i in range(n)]}
-    for key in HOURLY_FIELDS:
-        h[key] = []
-    for i in range(n):
-        positive = i % 37 < 9
-        hour = i % 24
-        surf = -1 + 4 * math.sin(i / 24)
-        values = {
-            'temperature_2m': surf,
-            'dew_point_2m': surf - (0.4 if positive else 5),
-            'relative_humidity_2m': 97 if positive else 62,
-            'cloud_cover_low': 85 if positive else 15,
-            'cloud_cover_mid': 8 if positive else 65,
-            'cloud_cover_high': 10 if positive else 55,
-            'wind_speed_10m': 7 if positive else 18,
-            'wind_direction_10m': 80 if positive else 260,
-            'visibility': 750 if positive else 12000,
-        }
-        z = [1950, 2460, 3010, 3600, 4260]
-        for p, z_p in zip(PRESSURE_LEVELS, z):
-            values.update({f'temperature_{p}hPa': surf + (2 if positive else -3) - (z_p - 1950) * .004,
-                           f'relative_humidity_{p}hPa': 90 if positive else 55,
-                           f'wind_speed_{p}hPa': 10,
-                           f'wind_direction_{p}hPa': 90,
-                           f'geopotential_height_{p}hPa': z_p})
-        for key in HOURLY_FIELDS:
-            h[key].append(values[key])
-    return {'latitude':40.015,'longitude':-105.27,'elevation':1640,'hourly':h}
+def hrrr_scalars(fog=False):
+    s = {('HGT','surface'): 1650.0,('TMP','2 m above ground'):280.0,
+         ('DPT','2 m above ground'): 279.5 if fog else 272.0,
+         ('RH','2 m above ground'): 98.0 if fog else 50.0,
+         ('UGRD','10 m above ground'): 2.0, ('VGRD','10 m above ground'):-3.0,
+         ('VIS','surface'): 200.0 if fog else 16000.0,
+         ('LCDC','low cloud layer'):95.0 if fog else 12.0,
+         ('MCDC','middle cloud layer'):20.0,('HCDC','high cloud layer'):18.0,
+         ('HPBL','surface'): 100.0 if fog else 1000.0,
+         ('HGT','cloud base'): 1900.0 if fog else 2900.0,
+         ('HGT','cloud top'): 2300.0 if fog else 3600.0}
+    p = {}
+    for pressure,z in zip([800,750,700,650,600],[1950,2420,3000,3550,4250]):
+        k=f'{pressure} mb'
+        p.update({('HGT',k):z,('TMP',k):282.0-(z-1950)*.004 if fog else 275-(z-1950)*.004,
+                  ('RH',k):90.0 if fog else 50.0,
+                  ('UGRD',k):3.0,('VGRD',k):-2.0,
+                  ('CLWMR',k):0.0003 if fog else 0.000001})
+    return s,p
 
 
-def test_feature_schema_and_proxy():
-    response = fixture_response(70)
-    rows = rows_from_data(response)
-    assert len(rows) == 70
-    assert rows[0]['features'].shape == (18,)
-    assert rows[0]['profile'].shape == (4, 25)
-    assert (proxy_label(rows[0]),proxy_label(rows[15])) == (1, 0)
-    assert abs(uv(36, 90)[0] + 10) < 1e-6
-    response['hourly']['temperature_750hPa'][0] = None
-    assert row_at(response, 0) is None
-    assert len(rows_from_data(response)) == 69
+def test_features_and_older_forecast_horizon(tmp_path):
+    i=datetime(2025,1,1,tzinfo=timezone.utc)
+    s,p=hrrr_scalars(True)
+    r=build_row(i,36,s,p)
+    assert r['features'] and len(r['features'])==len(FEATURE_NAMES)
+    assert np.asarray(r['profile']).shape==(len(PROFILE_CHANNELS),25)
+    assert r['lead_hours']==36 and r['observables']['lowClouds']==95
+    assert 5000 < r['observables']['forecast_cloud_base_ft_msl'] < 7000
+    write_jsonl(tmp_path/'rows.jsonl',[r])
+    assert load_jsonl(tmp_path/'rows.jsonl')[0]['timestamp']==r['timestamp']
+    a=list(historical_pairs(date(2019,1,1),date(2019,1,2),0,[24,36,39]))
+    assert len(a)==4 and max(f for _,f in a)==36
+    b=list(historical_pairs(date(2025,1,1),date(2025,1,1),0,[24,36,39]))
+    assert len(b)==3
 
 
-def test_chronological_training_reload_and_inference(tmp_path):
-    data = fixture_response()
-    results = train([data], allow_proxy=True, model_dir=tmp_path,
-                    cnn_epochs=3, xgb_estimators=25)
-    assert results['verified_observations'] is False
-    assert results['target'] == 'modeled_visibility_cloud_proxy'
-    assert results['test_rows'] > 0
-    pred = Predictor(tmp_path)
-    rows = rows_from_data(data)
-    answer = pred.predict(rows[:5])
-    assert len(answer) == 5
-    assert all(0 <= x['probability'] <= 1 for x in answer)
-    assert answer[0]['cloud_top_ft'] is None
-    assert {'cnn.pt','xgb.json','manifest.json'} <= {p.name for p in tmp_path.iterdir()}
+def test_low_ceiling_independent_of_visibility():
+    assert classify_low_ceiling({'skyc1':'OVC','skyl1':'400','vsby':'10'})==1
+    assert classify_low_ceiling({'skyc1':'CLR','vsby':'1'})==0
+    assert classify_low_ceiling({'vsby':'10'}) is None
+    raw='station,valid,vsby,skyc1,skyl1,wxcodes\nBDU,2026-06-01 12:06,10.0,OVC,400,\n'
+    r=parse_iem_csv(raw)[0]
+    assert r['observed_low_ceiling']==1 and r['observed_fog']==0
 
 
-def test_app_serves_ui_but_no_untrained_guesses(monkeypatch, tmp_path):
+def generate_fixture(days=160):
+    begin=datetime(2025,1,1,tzinfo=timezone.utc)
+    rows=[]; labels={}
+    for d in range(days):
+        init=begin+timedelta(days=d)
+        positive=(d%4==0)
+        s,p=hrrr_scalars(positive)
+        for lead in [24,30,36]:
+            row=build_row(init,lead,s,p)
+            rows.append(row)
+            labels[row['timestamp']]={'fog':int(positive),'low_ceiling':int(positive),
+                                      'cloud_base_ft':5900.0 + d*2}
+    return rows,labels
+
+
+def test_train_save_and_predict(tmp_path):
+    rows,obs=generate_fixture()
+    m=run_training(rows,obs,tmp_path,epochs=1,estimators=20)
+    assert m['target']=='observed_airport_low_ceiling'
+    assert m['dataset']['positive_days']>3
+    assert m['cloud_base']['available']
+    results=Predictor(tmp_path).predict([
+        {**r,'features':np.asarray(r['features'],dtype=np.float32),
+         'profile':np.asarray(r['profile'],dtype=np.float32)} for r in rows[-3:]])
+    assert len(results)==3
+    assert all(r['cloud_top_ft'] is None for r in results)
+    assert all(0<=r['probability']<=1 for r in results)
+
+
+def test_positive_episode_guard(tmp_path):
+    rows,obs=generate_fixture(160)
+    for r in rows:
+        if r['timestamp'][:4]=='2025' and r['timestamp'][5:7] in ('05','06'):
+            obs[r['timestamp']]['low_ceiling']=0
+    with pytest.raises(ValueError,match='positive calendar days'):
+        run_training(rows,obs,tmp_path,epochs=1,estimators=20)
+
+
+def test_local_api_using_offline_live_cache(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
     from inversion import server
-    monkeypatch.setattr(server, 'MODEL_DIR', tmp_path)
-    client = TestClient(app)
-    assert client.get('/').status_code == 200
-    assert client.get('/dashboard.js').status_code == 200
-    assert client.get('/api/health').json()['trained_models_available'] is False
-    response = client.get('/api/forecast')
-    assert response.status_code == 503
-    assert 'Models not trained' in response.json()['detail']
-
-
-def test_api_with_trained_artifacts_without_network(tmp_path, monkeypatch):
-    from inversion import server
-    from datetime import datetime, timezone, timedelta
-    from zoneinfo import ZoneInfo
-    train([fixture_response()], allow_proxy=True, model_dir=tmp_path,
-          cnn_epochs=2, xgb_estimators=15)
-    # Build forecast timestamps covering current Boulder 7-day window.
-    fake = fixture_response(n=240)
-    today = datetime.now(ZoneInfo('America/Denver')).date()
-    first_utc = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
-    fake['hourly']['time'] = [(first_utc + timedelta(hours=i)).strftime('%Y-%m-%dT%H:%M')
-                              for i in range(240)]
-    monkeypatch.setattr(server, 'MODEL_DIR', tmp_path)
-    monkeypatch.setattr(server, 'Predictor', lambda: Predictor(tmp_path))
-    monkeypatch.setattr(server, 'fetch_live', lambda: fake)
-    server._cache.update(data=None, at=0, stamp=None)
-    client = TestClient(app)
-    result = client.get('/api/forecast')
-    assert result.status_code == 200, result.text
-    payload = result.json()
-    assert payload['model']['verified_observations'] is False
-    assert 160 <= len(payload['hours']) <= 170  # 7 local days; DST changes day length
-    assert all(h['cloud_top_ft'] is None for h in payload['hours'])
-    assert client.get('/api/forecast').json() == payload  # TTL cache
+    rows, obs = generate_fixture()
+    run_training(rows, obs, tmp_path, epochs=1, estimators=20)
+    now = datetime.now(timezone.utc)
+    issue = now.replace(hour=(now.hour//6)*6, minute=0, second=0, microsecond=0)-timedelta(hours=6)
+    s,p = hrrr_scalars(True)
+    live = [build_row(issue, lead, s, p) for lead in (24, 30, 36)]
+    write_jsonl(tmp_path/'hrrr_live.jsonl', live, mode='w')
+    monkeypatch.setattr(server,'DATA_DIR',tmp_path)
+    monkeypatch.setattr(server,'MODEL_DIR',tmp_path)
+    client=TestClient(server.app)
+    assert client.get('/api/health').json()['trained_models_available'] is True
+    res=client.get('/api/forecast')
+    assert res.status_code == 200, res.text
+    body=res.json()
+    assert body['model']['target']=='observed_airport_low_ceiling'
+    assert all(r['cloud_top_ft'] is None for r in body['hours'])
+    assert all(0 <= r['probability'] <=1 for r in body['hours'])

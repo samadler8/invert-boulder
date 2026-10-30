@@ -26,7 +26,15 @@ __pycache__/
 .venv/
 *.pyc
 data/raw/
+data/gfs_runs/
 data/*.csv
-models/*.pt
-models/*.json
-!models/.gitkeep
+
+
+# HRRR raw subsets, local compact training cache and live sample cache
+/data/hrrr_tmp/
+/data/hrrr_samples.jsonl
+/data/hrrr_live.jsonl
+/data/*.jsonl
+/models/*.json
+/models/*.pt
+/models/cloud_base_report.json

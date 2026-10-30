@@ -14,7 +14,7 @@
     let state = {
       isLive: true,
       rawHourly: null,
-      daysData: [],           // 7 days of 24h metrics
+      daysData: [],           // issued-run hours (<72h)
       selectedDayIdx: 1,      // Default 1 = Tomorrow
       selectedHourIdx: 6,     // Default to peak hour of selected day
       chartMode: 'probability' // 'probability' or 'elevation'
@@ -54,7 +54,7 @@
         state.selectedDayIdx = Math.min(1, state.daysData.length - 1);
         state.selectedHourIdx = state.daysData[state.selectedDayIdx].peakHour;
         document.getElementById('apiStatusText').textContent = payload.model.verified_observations
-          ? 'Observed-label model (experimental)' : 'Proxy-trained model — unverified';
+          ? 'KBDU low-ceiling ML (experimental)' : 'Unverified model';
         document.getElementById('statusBadge').classList.remove('hidden');
         document.getElementById('modelCaveat').textContent = payload.model.warning;
         setActivePresetBtn('live');
@@ -72,6 +72,8 @@
         state.daysData = [];
         document.getElementById('forecastStrip').textContent = 'No live forecast available. Check the model training steps in README.';
         document.getElementById('hourlyChartSVG').innerHTML = '';
+        document.getElementById('landmarkForecasts').textContent = 'No valid elevation predictions available.';
+        document.getElementById('cloudBaseSummary').textContent = '';
         document.getElementById('fogRect').setAttribute('opacity','0');
         document.getElementById('fogTopPuffs').setAttribute('opacity','0');
         document.getElementById('breakoutLineGroup').style.display = 'none';
@@ -101,7 +103,7 @@
           ceiling: null, temp750: null,
         });
       }
-      const keys = [...daysMap.keys()].slice(0, 7);
+      const keys = [...daysMap.keys()].slice(0, 4);
       return keys.map((dateStr, idx) => {
         const dayHours = daysMap.get(dateStr);
         const morning = dayHours.filter(h => h.hour >= 4 && h.hour <= 10);
@@ -153,7 +155,7 @@
       // Render SVG Elevation Cross Section Diagram
       renderSVGDiagram(currentHourData);
 
-      // Render 7-Day Outlook Strip
+      // Render Short-range Outlook Strip
       render7DayStrip();
 
       // Render 24-Hour Timeline SVG Chart
@@ -161,6 +163,7 @@
 
       // Render Metric Breakdown Cards
       renderMetricCards(currentHourData);
+      renderLandmarkForecasts(currentHourData);
 
       // Render Hiking Recommendations Strategy
       renderHikingPlan(currentHourData);
@@ -193,7 +196,7 @@
         badge.className = 'text-[10px] font-bold uppercase tracking-wide text-amber-400 mt-1 px-2 py-1 bg-slate-900 rounded border border-amber-900';
         badge.textContent = label;
         verdictTitle.textContent = `XGBoost ${h.xgbScore}% · CNN ${h.cnnScore}%`;
-        verdictDesc.textContent = 'Ensemble estimates a low-fog, clearer-above setup. This is not a verified likelihood of a thermal inversion or a measured cloud ceiling. Check local observations before heading out.';
+        verdictDesc.textContent = `Predicted ${h.event === 'observed_airport_low_ceiling' ? 'low-cloud ceiling' : 'fog'} at Boulder Municipal Airport, ${h.lead_hours.toFixed(0)}h lead. HRRR vertical warming signal: ${h.forecast_inversion_warming_signal ? 'present' : 'not detected'}. Neither proves a thermal inversion or summit visibility.`;
         verdictIcon.className = 'fa-solid fa-chart-line text-cyan-400';
         verdictContainer.className = 'p-2.5 rounded-xl bg-cyan-950 text-cyan-400 text-lg flex-shrink-0';
         return;
@@ -347,7 +350,7 @@
     }
 
     /**
-     * Render 7-Day Outlook Strip
+     * Render Short-range Outlook Strip
      */
     function render7DayStrip() {
       const strip = document.getElementById('forecastStrip');
@@ -441,7 +444,7 @@
     }
 
     /**
-     * User clicks a day in the 7-day strip
+     * User clicks a day in the 72-hour strip
      */
     function selectDay(dayIdx) {
       state.selectedDayIdx = dayIdx;
@@ -482,6 +485,43 @@
       document.getElementById('barWind').style.width = `${Math.max(10, windQuality)}%`;
     }
 
+    /** Altitude is an explicit target, but do not fabricate summit-clear odds. */
+    function renderLandmarkForecasts(h) {
+      const panel = document.getElementById('landmarkForecasts');
+      const caption = document.getElementById('cloudBaseSummary');
+      if (!panel || !caption) return;
+      if (!state.isLive) {
+        panel.textContent = 'Synthetic scenario; no validated mountain probabilities.';
+        caption.textContent = '';
+        return;
+      }
+      const sites = h.landmarks || [];
+      panel.replaceChildren();
+      sites.forEach(site => {
+        const block = document.createElement('div');
+        block.className = 'bg-slate-900 border border-slate-700 rounded-xl p-3';
+        const name = document.createElement('div');
+        name.className = 'text-sm font-bold text-slate-200';
+        name.textContent = `${site.name} · ${site.elevation_ft.toLocaleString()} ft`;
+        const score = document.createElement('div');
+        score.className = 'text-lg font-bold text-cyan-300 mt-2';
+        score.textContent = site.scenic_probability === null ? 'Not trained' : `${Math.round(site.scenic_probability * 100)}%`;
+        const explanation = document.createElement('p');
+        explanation.className = 'text-xs text-slate-400 mt-1';
+        explanation.textContent = site.scenic_probability === null
+          ? 'Requires verified summit-clear observations.'
+          : 'Observed-fog AND observed-summit-clear training target; still experimental.';
+        block.append(name, score, explanation);
+        panel.appendChild(block);
+      });
+      const b = h.estimated_low_cloud_base_ft_msl;
+      const range = h.cloud_base_80pct_residual_interval_ft_msl;
+      caption.textContent = b === null ? 'Airport cloud-base regression unavailable: too few reported ceilings.'
+        : `Estimated low-cloud BASE near KBDU: ${b.toLocaleString()} ft MSL` +
+          (range ? ` (validation 80% absolute-residual band: ${range[0].toLocaleString()}–${range[1].toLocaleString()} ft).` : '.') +
+          ' This is NOT the top of the cloud layer or a guarantee of a clear peak.';
+    }
+
     /**
      * Render Hiking & Landmark Recommendations Strategy
      */
@@ -501,8 +541,8 @@
         alarm.textContent = 'Use local sunrise / trail conditions';
         thTitle.textContent = 'Check webcams and local observations';
         thDesc.textContent = 'A model forecast cannot guarantee you will climb above fog. Check current cloud bases, visibility, wind and trail conditions.';
-        boTitle.textContent = 'Cloud-top elevation unavailable';
-        boDesc.textContent = 'This version predicts a proxy event score; it does not determine cloud-top height or summit visibility.';
+        boTitle.textContent = h.estimated_low_cloud_base_ft_msl !== null ? `Reported-cloud-base estimate ~${Math.round(h.estimated_low_cloud_base_ft_msl).toLocaleString()} ft MSL` : 'Cloud-base and cloud-top unavailable';
+        boDesc.textContent = 'The elevation model estimates the base of a low cloud layer at KBDU when such a ceiling is reported. The top of the deck and summit clearance remain unknown unless independently trained.';
         gearTitle.textContent = 'Prepare for uncertain conditions';
         gearDesc.textContent = 'Carry a headlamp, warm and windproof layers, and navigation. Avoid committing to a hike based on this experimental score alone.';
         return;

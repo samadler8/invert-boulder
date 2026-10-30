@@ -40,11 +40,30 @@ The content is organized as follows:
 </file_summary>
 
 <directory_structure>
+data/
+  .gitkeep
+  summit_observations_template.txt
+inversion/
+  __init__.py
+  config.py
+  features.py
+  models.py
+  observations.py
+  predict.py
+  server.py
+  train.py
+  weather.py
+models/
+  .gitkeep
+tests/
+  test_pipeline.py
 .gitignore
+dashboard.js
 dl_inversion.py
 guide.html
 index.html
 README.md
+requirements-dev.txt
 requirements.txt
 science.html
 xgb_inversion.py
@@ -53,172 +72,1924 @@ xgb_inversion.py
 <files>
 This section contains the contents of the repository's files.
 
-<file path="dl_inversion.py">
-"""
-================================================================================
-APPROACH B: PYTORCH 1D-CNN / NEURAL NETWORK FOR ATMOSPHERIC VERTICAL PROFILES
-================================================================================
+<file path="data/summit_observations_template.txt">
+timestamp,target_elevation_ft,observed_summit_clear
+</file>
 
-[INSTRUCTIONS FOR NEXT LLM]:
-1. Data Pipeline Integration:
-   - Use `sounderpy` or `herbie-data` (Python packages) to fetch atmospheric soundings (KDNR Denver radiosondes or HRRR grid forecasts).
-   - Standardize inputs to a fixed vertical grid (e.g., 50 vertical pressure levels from 1000 hPa to 500 hPa).
-2. Tensor Shape Expected:
-   - Input Tensor: `(Batch_Size, Num_Channels, Num_Vertical_Levels)`
-   - `Num_Channels`: e.g., 4 channels [Temperature, Dewpoint, U-wind, V-wind]
-   - `Num_Vertical_Levels`: e.g., 50 standardized pressure/height steps.
-3. Multi-Task Learning Objective (Optional Extension):
-   - Output 1: Binary Classification (Inversion Present / Not Present)
-   - Output 2: Regression Output [Inversion Base Height (m), Inversion Top Height (m), Delta T (°C)]
-"""
+<file path="inversion/observations.py">
+"""Download genuinely independent surface weather observations from IEM METAR.
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+Airport fog/ceiling observations are NOT summit cloud-top observations.
+Unknown and ambiguous hours stay unlabeled (never negative by default).
+"""
+import argparse
+import csv
+import io
+import math
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+import requests
+from .config import (DATA_DIR, OBS_STATION, OBS_NETWORK,
+                     OBS_STATION_ELEV_FT)
+
+IEM_URL = 'https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py'
+CEILING_CODES = {'BKN', 'OVC', 'VV'}
+FOG_CODES = {'FG', 'FZFG'}
+
+
+def parse_num(s):
+    if s is None or str(s).strip().upper() in ('', 'M', 'T', 'NA', 'NULL'):
+        return None
+    try:
+        value = float(str(s).strip())
+        return value if math.isfinite(value) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def observed_cloud_base_ft(report):
+    """Lowest reported BKN/OVC/VV ceiling, meters? No: METAR skyl in ft AGL."""
+    candidates = []
+    for n in range(1, 5):
+        cover = (report.get(f'skyc{n}') or '').strip().upper()
+        height = parse_num(report.get(f'skyl{n}'))
+        if cover in CEILING_CODES and height is not None and 0 <= height <= 5000:
+            candidates.append(height)
+    return (min(candidates) + OBS_STATION_ELEV_FT) if candidates else None
+
+
+def classify_report(report):
+    """Conservative ground-level visibility/low-ceiling fog definition.
+
+    1 if vis<=1 mile and direct FG/FZFG or a reported ceiling <=1000ft AGL.
+    0 if vis>=5 miles and no fog code.
+    else None. Note cloud base is not cloud top, nor does METAR prove an inversion.
+    """
+    vsby = parse_num(report.get('vsby'))
+    wx = (report.get('wxcodes') or '').upper().replace('-', ' ').replace('+', ' ')
+    tokens = set(wx.split())
+    fog = bool(tokens & FOG_CODES)
+    base = observed_cloud_base_ft(report)
+    low_ceiling = base is not None and base - OBS_STATION_ELEV_FT <= 1000
+    if vsby is None:
+        return None
+    if vsby <= 1 and (fog or low_ceiling):
+        return 1
+    if vsby >= 5 and not fog:
+        return 0
+    return None
+
+
+def parse_iem_csv(raw):
+    """Convert unvalidated METAR reports to nearest hour, prefer closest report.
+
+    Rejects duplicate station-hour collisions by choosing the observation closest
+    to the UTC forecast valid time; ties prefer later report.
+    """
+    meaningful = '\n'.join(line for line in raw.splitlines()
+                            if line.strip() and not line.lstrip().startswith('#'))
+    reader = csv.DictReader(io.StringIO(meaningful))
+    if not {'valid', 'vsby', 'station'}.issubset(reader.fieldnames or []):
+        raise ValueError('IEM CSV missing expected valid/vsby/station columns')
+    selected = {}
+    for r in reader:
+        if r.get('station', '').upper().removeprefix('K') != OBS_STATION:
+            continue
+        rawtime = r.get('valid', '').strip()
+        try:
+            at = datetime.fromisoformat(rawtime.replace('Z', '+00:00'))
+            at = at.replace(tzinfo=timezone.utc) if at.tzinfo is None else at.astimezone(timezone.utc)
+        except ValueError:
+            continue
+        closest = (at + timedelta(minutes=30)).replace(minute=0, second=0, microsecond=0)
+        offset = abs((at - closest).total_seconds())
+        if offset > 30 * 60:
+            continue
+        key = closest.isoformat().replace('+00:00', 'Z')
+        priority = (offset, -at.timestamp())
+        if key not in selected or priority < selected[key][0]:
+            selected[key] = (priority, r)
+    results = []
+    for stamp, (_, r) in sorted(selected.items()):
+        label = classify_report(r)
+        base_ft = observed_cloud_base_ft(r)
+        results.append({
+            'timestamp': stamp, 'station': OBS_STATION,
+            'observed_fog': '' if label is None else label,
+            'observed_cloud_base_ft_msl': '' if base_ft is None else round(base_ft),
+            'visibility_miles': '' if parse_num(r.get('vsby')) is None else parse_num(r.get('vsby')),
+            'source': 'IEM METAR (independent station observation)',
+        })
+    return results
+
+
+def download_iem(start, end, *, session=None):
+    """Start inclusive, end inclusive (dates); download query uses exclusive end."""
+    if start > end:
+        raise ValueError('start must precede end')
+    client = session or requests
+    output = []
+    cur = start
+    while cur <= end:
+        stop = min(end + timedelta(days=1), cur + timedelta(days=31))
+        params = [
+            ('station', OBS_STATION), ('network', OBS_NETWORK), ('data', 'all'),
+            ('year1', cur.year), ('month1', cur.month), ('day1', cur.day),
+            ('year2', stop.year), ('month2', stop.month), ('day2', stop.day),
+            ('tz', 'Etc/UTC'), ('format', 'onlycomma'),
+            ('latlon', 'no'), ('elev', 'no'), ('missing', 'M'),
+            ('trace', 'T'), ('direct', 'no'),
+            ('report_type', '3'), ('report_type', '4'),
+        ]
+        response = client.get(IEM_URL, params=params, timeout=120)
+        response.raise_for_status()
+        output.extend(parse_iem_csv(response.text))
+        cur = stop
+    return list({r['timestamp']: r for r in output}.values())
+
+
+def save_csv(records, dest):
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    names = ('timestamp', 'station', 'observed_fog', 'observed_cloud_base_ft_msl',
+             'visibility_miles', 'source')
+    with dest.open('w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=names)
+        writer.writeheader()
+        writer.writerows(records)
+
+
+def read_csv(path):
+    records = {}
+    with open(path, newline='') as f:
+        for r in csv.DictReader(f):
+            key = r['timestamp']
+            if key in records:
+                raise ValueError(f'Duplicate station observation hour: {key}')
+            label = (int(r['observed_fog']) if r.get('observed_fog', '') != '' else None)
+            if label not in (None, 0, 1):
+                raise ValueError(f'Invalid observed fog label: {label}')
+            base = parse_num(r.get('observed_cloud_base_ft_msl'))
+            records[key] = {'fog': label, 'cloud_base_ft': base}
+    return records
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--start', type=date.fromisoformat, required=True)
+    parser.add_argument('--end', type=date.fromisoformat, required=True)
+    parser.add_argument('--output', type=Path, default=DATA_DIR / 'observed_bdu.csv')
+    args = parser.parse_args()
+    records = download_iem(args.start, args.end)
+    save_csv(records, args.output)
+    counts = {k: sum(r['observed_fog'] == k for r in records) for k in (0, 1)}
+    print(f'Saved {len(records)} unique reported hours: {counts[1]} fog, {counts[0]} clear; '
+          f'{sum(r["observed_cloud_base_ft_msl"] != "" for r in records)} low cloud-base reports. '
+          f'Unlabeled hours remain unknown. File: {args.output}')
+
+
+if __name__ == '__main__':
+    main()
+</file>
+
+<file path="data/.gitkeep">
+
+</file>
+
+<file path="inversion/__init__.py">
+"""Boulder inversion forecast post-processing package."""
+</file>
+
+<file path="inversion/config.py">
+"""The model contract. Any change to features or heights requires retraining."""
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+MODEL_DIR = ROOT / 'models'
+DATA_DIR = ROOT / 'data'
+BOULDER_LAT, BOULDER_LON = 40.015, -105.2705
+TIMEZONE = 'America/Denver'
+MODEL_SOURCE = 'gfs_global'
+MODEL_VERSION = 'gfs-run-fog-elevation-v2'
+# The GFS Single Runs archive starts in April 2026; not the stitched historical archive.
+ARCHIVE_START = '2026-04-02T00:00'
+MAX_LEAD_HOURS = 72  # strict bound: 0 <= lead < 72 hours from run initialization
+PRESSURE_LEVELS = (800, 750, 700, 650, 600)
+PROFILE_CHANNELS = ('temperature_c', 'relative_humidity_pct', 'u_wind_ms', 'v_wind_ms', 'pressure_cloud_pct')
+PROFILE_LEVELS = 25
+PROFILE_TOP_AGL_M = 2000
+LANDMARKS_FT = {'Boulder': 5400, 'First Flatiron': 7200, 'Green Mountain': 8100}
+# KBDU airport lies outside downtown Boulder and may have different fog conditions.
+OBS_STATION, OBS_NETWORK = 'BDU', 'CO_ASOS'
+OBS_STATION_ELEV_FT = 5288  # KBDU published airport elevation; geographically distinct from downtown Boulder
+SURFACE_FIELDS = (
+    'temperature_2m', 'dew_point_2m', 'relative_humidity_2m',
+    'cloud_cover_low', 'cloud_cover_mid', 'cloud_cover_high',
+    'wind_speed_10m', 'wind_direction_10m',
+    'visibility', 'weather_code',
+)
+OPTIONAL_FIELDS = ('boundary_layer_height',)
+PROFILE_FIELDS = tuple(
+    f'{kind}_{p}hPa'
+    for p in PRESSURE_LEVELS
+    for kind in ('temperature', 'relative_humidity', 'cloud_cover',
+                 'wind_speed', 'wind_direction', 'geopotential_height')
+)
+HOURLY_FIELDS = SURFACE_FIELDS + OPTIONAL_FIELDS + PROFILE_FIELDS
+FEATURE_NAMES = (
+    'temperature_2m', 'dewpoint_depression', 'relative_humidity_2m',
+    'low_cloud_pct', 'mid_cloud_pct', 'high_cloud_pct',
+    'forecast_visibility_log_m', 'forecast_pbl_height_m',
+    'forecast_fog_weather_code', 'pressure_cloud_300m', 'pressure_cloud_750m',
+    'wind_u_10m_ms', 'wind_v_10m_ms',
+    't_delta_300m', 't_delta_750m', 'rh_300m', 'rh_750m',
+    'wind_u_300m_ms', 'wind_v_300m_ms',
+    'lead_hours', 'hour_sin', 'hour_cos', 'year_sin', 'year_cos',
+)
+SCENIC_FEATURE_NAMES = FEATURE_NAMES + ('target_elevation_ft',)
+</file>
+
+<file path="inversion/features.py">
+"""Shared train/serve transformation of initialized forecasts into rows."""
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+import math
 import numpy as np
 
-# ==============================================================================
-# 1. CUSTOM DATASET CLASS FOR VERTICAL ATMOSPHERIC PROFILES
-# ==============================================================================
-
-class AtmosphericSoundingDataset(Dataset):
-    """
-    Dataset wrapper for 1D vertical profile soundings.
-    
-    Attributes:
-    -----------
-    profiles: np.ndarray of shape (N, C, L)
-              N = samples, C = variables (Temp, Dewpoint, U-wind, V-wind), L = vertical levels
-    labels: np.ndarray of shape (N,)
-            Binary indicator (1 = Inversion present in boundary layer, 0 = Normal lapse rate)
-    """
-    def __init__(self, profiles: np.ndarray, labels: np.ndarray):
-        self.profiles = torch.tensor(profiles, dtype=torch.float32)
-        self.labels = torch.tensor(labels, dtype=torch.float32).unsqueeze(1)
-
-    def __len__(self):
-        return len(self.profiles)
-
-    def __getitem__(self, idx):
-        return self.profiles[idx], self.labels[idx]
+from .config import (FEATURE_NAMES, PRESSURE_LEVELS, PROFILE_LEVELS,
+                     PROFILE_TOP_AGL_M, SURFACE_FIELDS, PROFILE_FIELDS,
+                     TIMEZONE, MAX_LEAD_HOURS)
 
 
-# ==============================================================================
-# 2. 1D-CNN ARCHITECTURE FOR VERTICAL ATMOSPHERIC SOUNDINGS
-# ==============================================================================
+def utcparse(s):
+    dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)  # Open-Meteo times requested as UTC
+    return dt.astimezone(timezone.utc)
 
-class InversionProfileCNN1D(nn.Module):
-    """
-    1D Convolutional Neural Network designed to extract feature patterns 
-    (such as thermal inversions or lapse rate changes) along the vertical atmospheric column.
-    """
-    def __init__(self, in_channels: int = 4, num_levels: int = 50):
-        super(InversionProfileCNN1D, self).__init__()
-        
-        # 1D Convolutions slide vertically from ground level up through atmosphere
-        self.conv_block = nn.Sequential(
-            nn.Conv1d(in_channels=in_channels, out_channels=16, kernel_size=3, padding=1),
-            nn.BatchNorm1d(16),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),  # Halves resolution (50 -> 25)
 
-            nn.Conv1d(in_channels=16, out_channels=32, kernel_size=3, padding=1),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(8)       # Fixed output size regardless of input profile depth
+def uv(speed_kmh, bearing_deg):
+    angle = math.radians(float(bearing_deg))
+    speed = float(speed_kmh) / 3.6
+    return -speed * math.sin(angle), -speed * math.cos(angle)
+
+
+def row_at(data, i):
+    """None if missing/out-of-horizon; no guessed fields or zero-imputation."""
+    h = data.get('hourly', {})
+    try:
+        init = utcparse(data['_run_utc'])
+        timestamp = utcparse(h['time'][i])
+        lead = (timestamp - init).total_seconds() / 3600
+        if not 0 <= lead < MAX_LEAD_HOURS:
+            return None
+        values = {k: float(h[k][i]) for k in SURFACE_FIELDS + PROFILE_FIELDS}
+        if not all(np.isfinite(v) for v in values.values()):
+            return None
+        # Some GFS sub-products omit boundary-layer height; XGBoost handles NaN.
+        pbl = h.get('boundary_layer_height', [None] * len(h['time']))[i]
+        pbl = float(pbl) if pbl is not None else float('nan')
+        local = timestamp.astimezone(ZoneInfo(TIMEZONE))
+        z_ground = float(data['elevation'])
+        z_surface = z_ground + 2
+        zs = [z_surface]
+        t = [values['temperature_2m']]
+        rh = [values['relative_humidity_2m']]
+        u0, v0 = uv(values['wind_speed_10m'], values['wind_direction_10m'])
+        u, v = [u0], [v0]
+        # Cloud cover at ground is NOT a pressure-level measurement.
+        cp_z, cp_values = [], []
+        for p in PRESSURE_LEVELS:
+            z = values[f'geopotential_height_{p}hPa']
+            if z < z_surface + 5:
+                continue
+            up, vp = uv(values[f'wind_speed_{p}hPa'], values[f'wind_direction_{p}hPa'])
+            zs.append(z)
+            t.append(values[f'temperature_{p}hPa'])
+            rh.append(values[f'relative_humidity_{p}hPa'])
+            u.append(up)
+            v.append(vp)
+            cp_z.append(z)
+            cp_values.append(values[f'cloud_cover_{p}hPa'])
+        order = np.argsort(zs)
+        heights = np.asarray(zs)[order]
+        if len(heights) < 4 or heights[-1] < z_surface + PROFILE_TOP_AGL_M:
+            return None
+        if np.any(np.diff(heights) < 1):
+            return None
+        if len(cp_z) < 2:
+            return None
+        def interp(channel, height):
+            return float(np.interp(height, heights, np.asarray(channel)[order]))
+        grid = np.linspace(z_surface, z_surface + PROFILE_TOP_AGL_M,
+                           PROFILE_LEVELS, dtype=np.float32)
+        profile = np.stack([
+            *[np.interp(grid, heights, np.asarray(ch)[order]) for ch in (t, rh, u, v)],
+            np.interp(grid, cp_z, cp_values),
+        ]).astype(np.float32)
+        # Boundary held constant only for below-first-pressure-level cloud cover;
+        # this is model interpolation, not new independent observations.
+        cp300 = float(np.interp(z_surface + 300, cp_z, cp_values))
+        cp750 = float(np.interp(z_surface + 750, cp_z, cp_values))
+        year_phase = 2 * math.pi * (local.timetuple().tm_yday / 365.25)
+        hour_phase = 2 * math.pi * (local.hour / 24)
+        features = np.asarray([
+            values['temperature_2m'], values['temperature_2m'] - values['dew_point_2m'],
+            values['relative_humidity_2m'],
+            values['cloud_cover_low'], values['cloud_cover_mid'], values['cloud_cover_high'],
+            math.log1p(max(0.0, values['visibility'])),
+            pbl,
+            float(int(values['weather_code']) in (45, 48)),
+            cp300, cp750, u0, v0,
+            interp(t, z_surface + 300) - t[0],
+            interp(t, z_surface + 750) - t[0],
+            interp(rh, z_surface + 300), interp(rh, z_surface + 750),
+            interp(u, z_surface + 300), interp(v, z_surface + 300),
+            lead, math.sin(hour_phase), math.cos(hour_phase),
+            math.sin(year_phase), math.cos(year_phase),
+        ], dtype=np.float32)
+        assert len(features) == len(FEATURE_NAMES)
+        return {
+            'timestamp': timestamp.isoformat().replace('+00:00', 'Z'),
+            'run_utc': init.isoformat().replace('+00:00', 'Z'),
+            'lead_hours': lead,
+            'local_time': local.isoformat(),
+            'features': features,
+            'profile': profile,
+            'observables': {
+                'lowClouds': values['cloud_cover_low'],
+                'midClouds': values['cloud_cover_mid'],
+                'highClouds': values['cloud_cover_high'],
+                'surfTemp': values['temperature_2m'],
+                'dewPoint': values['dew_point_2m'],
+                'rh': values['relative_humidity_2m'],
+                'tempDelta': interp(t, z_surface + 300) - t[0],
+                'windSpeed': values['wind_speed_10m'] / 1.609344,
+                'windDir': values['wind_direction_10m'],
+                'forecast_visibility_m': values['visibility'],
+                'forecast_boundary_layer_height_m': float(pbl) if np.isfinite(pbl) else None,
+                'forecast_pressure_cloud_300m': cp300,
+                'forecast_pressure_cloud_750m': cp750,
+                'forecast_weather_code': int(values['weather_code']),
+            },
+        }
+    except (ValueError, KeyError, IndexError, TypeError, AssertionError):
+        return None
+
+
+def rows_from_data(response):
+    return [r for i in range(len(response.get('hourly', {}).get('time', [])))
+            if (r := row_at(response, i)) is not None]
+</file>
+
+<file path="inversion/models.py">
+"""XGBoost + small 1D-CNN with common probability calibration."""
+from copy import deepcopy
+import numpy as np
+import torch
+from torch import nn
+from xgboost import XGBClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (average_precision_score, brier_score_loss,
+                             roc_auc_score, log_loss)
+
+from .config import PROFILE_CHANNELS, PROFILE_LEVELS
+
+
+class ProfileCNN(nn.Module):
+    def __init__(self, channels=len(PROFILE_CHANNELS)):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv1d(channels, 16, 3, padding=1), nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(16, 32, 3, padding=1), nn.ReLU(),
+            nn.AdaptiveAvgPool1d(6),
         )
+        self.head = nn.Sequential(nn.Flatten(), nn.Linear(32 * 6, 32),
+                                  nn.ReLU(), nn.Dropout(.2), nn.Linear(32, 1))
 
-        # Dense Classifier Head
-        self.classifier = nn.Sequential(
-            nn.Linear(32 * 8, 64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, 1)  # Outputs raw logits for binary classification
-        )
-
-    def forward(self, x):
-        # Input shape: (Batch, Channels, Levels)
-        x = self.conv_block(x)
-        x = x.view(x.size(0), -1)  # Flatten
-        logits = self.classifier(x)
-        return logits
+    def forward(self, profile):
+        return self.head(self.body(profile)).squeeze(-1)
 
 
-# ==============================================================================
-# 3. TRAINING & VALIDATION LOOP
-# ==============================================================================
-
-def train_dl_inversion_model(model, dataloader, epochs=10, lr=1e-3):
-    criterion = nn.BCEWithLogitsLoss()  # Numerically stable for binary classification
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
-    model.train()
-    for epoch in range(epochs):
-        total_loss = 0.0
-        for profiles, labels in dataloader:
-            optimizer.zero_grad()
-            outputs = model(profiles)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item() * profiles.size(0)
-
-        epoch_loss = total_loss / len(dataloader.dataset)
-        print(f"Epoch [{epoch+1}/{epochs}] - Loss: {epoch_loss:.4f}")
-
+def train_xgb(x_train, y_train, x_val, y_val, *, estimators=300):
+    pos = max(int(y_train.sum()), 1)
+    neg = len(y_train) - pos
+    model = XGBClassifier(
+        n_estimators=estimators, max_depth=3, learning_rate=.05,
+        subsample=.85, colsample_bytree=.9, min_child_weight=4,
+        objective='binary:logistic', eval_metric='logloss',
+        scale_pos_weight=min(15, max(1.0, neg / pos)),
+        tree_method='hist', n_jobs=4, random_state=42,
+        early_stopping_rounds=25 if estimators >= 50 else None,
+    )
+    model.fit(x_train, y_train, eval_set=[(x_val, y_val)], verbose=False)
     return model
 
 
-# ==============================================================================
-# 4. PLACEHOLDER EXECUTION FOR VERIFICATION
-# ==============================================================================
+def standardizer(profiles):
+    means = profiles.mean(axis=(0, 2), keepdims=True).astype(np.float32)
+    scales = np.maximum(profiles.std(axis=(0, 2), keepdims=True), 0.001).astype(np.float32)
+    return means, scales
 
-if __name__ == "__main__":
-    # Parameters matching real soundings
-    NUM_SAMPLES = 500
-    CHANNELS = 4       # [Temp, Dewpoint, U_wind, V_wind]
-    HEIGHT_LEVELS = 50 # 50 discrete pressure layers
 
-    # Generate random test profiles (Shape: [500, 4, 50])
-    dummy_profiles = np.random.randn(NUM_SAMPLES, CHANNELS, HEIGHT_LEVELS)
-    dummy_labels = np.random.randint(0, 2, size=NUM_SAMPLES)
+def normalize(profiles, mean, scale):
+    return ((profiles - mean) / scale).astype(np.float32)
 
-    # Initialize Dataset and DataLoader
-    dataset = AtmosphericSoundingDataset(dummy_profiles, dummy_labels)
-    loader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-    # Instantiate and test model forward pass
-    model = InversionProfileCNN1D(in_channels=CHANNELS, num_levels=HEIGHT_LEVELS)
-    print("Model Architecture Initialized:\n", model)
-    
-    # Train test loop
-    print("\nRunning test training loop...")
-    trained_model = train_dl_inversion_model(model, loader, epochs=3)
+def train_cnn(p_train, y_train, p_val, y_val, *, epochs=25, batch_size=64, patience=6):
+    """CPU-compatible; CUDA/MPS opt-in can be added when needed."""
+    torch.manual_seed(42)
+    mean, scale = standardizer(p_train)
+    tr = torch.from_numpy(normalize(p_train, mean, scale))
+    va = torch.from_numpy(normalize(p_val, mean, scale))
+    tr_y = torch.from_numpy(np.asarray(y_train, dtype=np.float32))
+    va_y = torch.from_numpy(np.asarray(y_val, dtype=np.float32))
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(tr, tr_y),
+        batch_size=batch_size, shuffle=True)
+    model = ProfileCNN()
+    weight = min(15, max(1.0, (len(y_train) - sum(y_train)) / max(sum(y_train), 1)))
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(weight, dtype=torch.float32))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=.001, weight_decay=.001)
+    best, best_loss, stalls = None, float('inf'), 0
+    for epoch in range(epochs):
+        model.train()
+        for batch_x, batch_y in loader:
+            optimizer.zero_grad()
+            loss = criterion(model(batch_x), batch_y)
+            loss.backward()
+            optimizer.step()
+        model.eval()
+        with torch.no_grad():
+            v_loss = criterion(model(va), va_y).item()
+        if v_loss < best_loss - 1e-4:
+            best, best_loss, stalls = deepcopy(model.state_dict()), v_loss, 0
+        else:
+            stalls += 1
+            if stalls >= patience:
+                break
+    model.load_state_dict(best)
+    model.eval()
+    return model, mean, scale, {'epochs_ran': epoch + 1, 'val_loss': best_loss}
+
+
+def raw_cnn(model, profiles, mean, scale):
+    with torch.no_grad():
+        normalized = torch.from_numpy(normalize(profiles, mean, scale))
+        return torch.sigmoid(model(normalized)).cpu().numpy().astype(float)
+
+
+def platt_fit(raw_probs, labels):
+    """Calibrate only on untouched, chronologically later validation period."""
+    p = np.asarray(raw_probs).clip(1e-5, 1 - 1e-5)
+    x = np.log(p / (1-p)).reshape(-1, 1)
+    calibrator = LogisticRegression(C=1.0, max_iter=200)
+    calibrator.fit(x, labels)
+    return [float(calibrator.coef_[0, 0]), float(calibrator.intercept_[0])]
+
+
+def platt_apply(raw_probs, params):
+    p = np.asarray(raw_probs).clip(1e-5, 1 - 1e-5)
+    z = params[0] * np.log(p / (1-p)) + params[1]
+    return 1 / (1 + np.exp(-np.clip(z, -45, 45)))
+
+
+def metrics(y_true, probs):
+    y_true = np.asarray(y_true)
+    probs = np.asarray(probs).clip(1e-7, 1-1e-7)
+    values = {
+        'count': len(y_true), 'positive_rate': round(float(y_true.mean()), 4),
+        'brier': round(float(brier_score_loss(y_true, probs)), 4),
+        'log_loss': round(float(log_loss(y_true, probs, labels=[0, 1])), 4),
+    }
+    if len(set(y_true)) == 2:
+        values['roc_auc'] = round(float(roc_auc_score(y_true, probs)), 4)
+        values['average_precision'] = round(float(average_precision_score(y_true, probs)), 4)
+    return values
 </file>
 
-<file path="requirements.txt">
-# Base Data Science Dependencies
-numpy>=1.22.0
-pandas>=1.4.0
-scikit-learn>=1.0.0
+<file path="inversion/predict.py">
+"""Safe post-processing inference: separate airport fog, cloud base and scenic events."""
+import json
+from math import exp
+from pathlib import Path
 
-# Approach A Dependencies
-xgboost>=1.6.0
-lightgbm>=3.3.0
+import numpy as np
+import torch
+from xgboost import XGBClassifier, XGBRegressor
+from .config import (MODEL_DIR, FEATURE_NAMES, SCENIC_FEATURE_NAMES,
+                     PROFILE_CHANNELS, PROFILE_LEVELS, PROFILE_TOP_AGL_M, OBS_STATION_ELEV_FT,
+                     MODEL_VERSION, MODEL_SOURCE, MAX_LEAD_HOURS, LANDMARKS_FT)
+from .models import ProfileCNN, raw_cnn, platt_apply
 
-# Approach B Dependencies
-torch>=2.0.0
 
-# Weather / Atmospheric Data Fetching (For Next LLM to connect)
-metpy>=1.4.0
-sounderpy>=0.5.0
-herbie-data>=2023.3.0
-xarray>=2022.03.0
+class Predictor:
+    def __init__(self, model_dir=MODEL_DIR):
+        directory = Path(model_dir)
+        self.manifest = json.loads((directory / 'manifest.json').read_text())
+        m = self.manifest
+        valid = (m['version'] == MODEL_VERSION and m['data_model'] == MODEL_SOURCE
+                 and m['features'] == list(FEATURE_NAMES)
+                 and m['channels'] == list(PROFILE_CHANNELS)
+                 and m['profile_levels'] == PROFILE_LEVELS
+                 and m['profile_top_agl_m'] == PROFILE_TOP_AGL_M
+                 and m['max_lead_hours_exclusive'] == MAX_LEAD_HOURS
+                 and m['verified_observations'] is True)
+        if not valid:
+            raise RuntimeError('Saved model contract differs from observation-trained v2 code. Retrain.')
+        self.xgb = XGBClassifier()
+        self.xgb.load_model(str(directory / 'xgb.json'))
+        saved = torch.load(str(directory / 'cnn.pt'), map_location='cpu', weights_only=True)
+        self.cnn = ProfileCNN()
+        self.cnn.load_state_dict(saved['state_dict'])
+        self.cnn.eval()
+        self.mean = saved['mean'].numpy()
+        self.scale = saved['scale'].numpy()
+        self.base = None
+        self.scenic = None
+        if m['cloud_base']['available']:
+            self.base = XGBRegressor()
+            self.base.load_model(str(directory / 'cloud_base.json'))
+        if m['scenic']['available']:
+            if m['scenic']['features'] != list(SCENIC_FEATURE_NAMES):
+                raise RuntimeError('Saved scenic feature schema incompatible')
+            self.scenic = XGBClassifier()
+            self.scenic.load_model(str(directory / 'scenic.json'))
+
+    def predict(self, rows):
+        if not rows:
+            return []
+        if any(not 0 <= r['lead_hours'] < MAX_LEAD_HOURS for r in rows):
+            raise ValueError('Only issue-time leads strictly below 72 hours are permitted')
+        x = np.stack([r['features'] for r in rows])
+        p = np.stack([r['profile'] for r in rows])
+        x_p = platt_apply(self.xgb.predict_proba(x)[:, 1],
+                          self.manifest['calibration']['xgb'])
+        c_p = platt_apply(raw_cnn(self.cnn, p, self.mean, self.scale),
+                          self.manifest['calibration']['cnn'])
+        bases = self.base.predict(x) if self.base is not None else [None] * len(rows)
+        landmark_probs = {}
+        if self.scenic is not None:
+            for name, ft in LANDMARKS_FT.items():
+                if ft not in self.manifest['scenic']['trained_elevations_ft']:
+                    continue  # No out-of-sample altitude extrapolation without validation.
+                xr = np.column_stack([x, np.full(len(x), ft, dtype=np.float32)])
+                landmark_probs[name] = platt_apply(self.scenic.predict_proba(xr)[:, 1],
+                                                    self.manifest['scenic']['calibration'])
+        result = []
+        for i, row in enumerate(rows):
+            # Forecast thermal signal is an NWP diagnostic, not a trained event probability.
+            temp_profile = row['profile'][0]
+            upward_warming = bool(np.any(np.diff(temp_profile[:8]) > .25))
+            base = None if bases[i] is None else max(float(OBS_STATION_ELEV_FT), float(bases[i]))
+            spread = float(self.manifest['cloud_base']['validation_80pct_abs_residual_ft']) if base is not None else None
+            points = [
+                {'name': name, 'elevation_ft': ft,
+                 'scenic_probability': round(float(landmark_probs[name][i]), 4)
+                 if name in landmark_probs else None}
+                for name, ft in LANDMARKS_FT.items()
+            ]
+            result.append({
+                'timestamp': row['timestamp'], 'run_utc': row['run_utc'],
+                'lead_hours': row['lead_hours'], 'local_time': row['local_time'],
+                **row['observables'],
+                'xgb_probability': round(float(x_p[i]), 4),
+                'cnn_probability': round(float(c_p[i]), 4),
+                'probability': round(float((x_p[i] + c_p[i]) / 2), 4),
+                'event': 'observed_airport_fog',
+                'forecast_inversion_warming_signal': upward_warming,
+                'estimated_low_cloud_base_ft_msl': round(base) if base is not None else None,
+                'cloud_base_80pct_residual_interval_ft_msl': [
+                    round(base - spread), round(base + spread)] if base is not None else None,
+                'cloud_top_ft': None,  # METAR has no cloud-top observation.
+                'landmarks': points,
+            })
+        return result
 </file>
 
-<file path="xgb_inversion.py">
+<file path="inversion/server.py">
+"""Local web inference server. Requires saved observation-trained artifacts."""
+from datetime import datetime, timezone
+from pathlib import Path
+import threading
+import time
 
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from .config import ROOT, MODEL_DIR, MAX_LEAD_HOURS
+from .features import rows_from_data, utcparse
+from .weather import latest_available_run
+from .predict import Predictor
+
+app = FastAPI(title='Boulder Short-Range Fog & Inversion Predictor', version='2.0.0')
+_lock = threading.RLock()
+_cache = {'at': 0.0, 'data': None, 'stamp': None}
+_loaded = {'stamp': None, 'predictor': None}
+
+
+def load_predictor():
+    path = MODEL_DIR / 'manifest.json'
+    if not path.exists():
+        raise HTTPException(503, 'Observation-trained model not found. Download METAR labels and train first; see README.')
+    with _lock:
+        stamp = path.stat().st_mtime_ns
+        if _loaded['stamp'] == stamp and _loaded['predictor'] is not None:
+            return _loaded['predictor']
+        try:
+            model = Predictor(MODEL_DIR)
+        except (ValueError, RuntimeError, FileNotFoundError, KeyError) as exc:
+            raise HTTPException(503, f'Cannot load trained models: {exc}') from exc
+        _loaded.update(stamp=stamp, predictor=model)
+        return model
+
+
+@app.get('/')
+def index():
+    return FileResponse(ROOT / 'index.html')
+
+
+@app.get('/{name}')
+def site_file(name: str):
+    if name not in ('guide.html', 'science.html', 'dashboard.js'):
+        raise HTTPException(404, 'Not found')
+    return FileResponse(ROOT / name)
+
+
+@app.get('/api/health')
+def health():
+    return {'status': 'ok', 'trained_models_available': (MODEL_DIR / 'manifest.json').exists(),
+            'forecast_horizon_hours_exclusive': MAX_LEAD_HOURS}
+
+
+@app.get('/api/forecast')
+def forecast(refresh: bool = False):
+    predictor = load_predictor()
+    with _lock:
+        stamp = _loaded['stamp']
+        if (not refresh and _cache['data'] is not None
+                and time.monotonic() - _cache['at'] < 1800
+                and _cache['stamp'] == stamp):
+            return _cache['data']
+    now = datetime.now(timezone.utc)
+    try:
+        data = latest_available_run(now=now)
+        issue = utcparse(data['_run_utc'])
+        rows = [r for r in rows_from_data(data)
+                if now <= utcparse(r['timestamp']) and 0 <= r['lead_hours'] < MAX_LEAD_HOURS]
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(502, f'Initialized GFS forecast acquisition failed: {exc}') from exc
+    if len(rows) < 8:
+        raise HTTPException(502, 'Less than 8 complete GFS hours available for this initialized run.')
+    result = {
+        'source': 'Open-Meteo GFS Single Runs (explicit 6-hour-cycle forecast issue time)',
+        'forecast_run_utc': issue.isoformat(),
+        'fetched_at_utc': now.isoformat(),
+        'model': {
+            'target': predictor.manifest['target'],
+            'verified_observations': predictor.manifest['verified_observations'],
+            'warning': predictor.manifest['disclaimer'],
+            'test_metrics': predictor.manifest['test_metrics'],
+            'cloud_base_available': predictor.manifest['cloud_base']['available'],
+            'scenic_available': predictor.manifest['scenic']['available'],
+            'max_lead_hours_exclusive': MAX_LEAD_HOURS,
+        },
+        'hours': predictor.predict(rows),
+    }
+    with _lock:
+        _cache.update(at=time.monotonic(), data=result, stamp=stamp)
+    return result
+</file>
+
+<file path="inversion/train.py">
+"""Train on issued GFS runs aligned to independent METAR station labels.
+
+Usage: python -m inversion.train --start 2026-05-01 --end 2026-10-01 \
+ --observations data/observed_bdu.csv
+
+Optional manually verified landmark labels enable direct scenic-event model:
+  timestamp,target_elevation_ft,observed_summit_clear
+  2026-09-01T12:00:00Z,8100,1
+Do NOT infer summit-clear labels from airport cloud bases.
+"""
+import argparse
+import csv
+import json
+import math
+from datetime import date, datetime, time, timezone, timedelta
+from pathlib import Path
+
+import numpy as np
+import torch
+from sklearn.metrics import mean_absolute_error
+from xgboost import XGBRegressor
+
+from .config import (DATA_DIR, MODEL_DIR, FEATURE_NAMES, SCENIC_FEATURE_NAMES,
+                     PROFILE_CHANNELS, PROFILE_LEVELS, PROFILE_TOP_AGL_M,
+                     MODEL_VERSION, MODEL_SOURCE, MAX_LEAD_HOURS, ARCHIVE_START)
+from .features import rows_from_data
+from .weather import fetch_archive
+from .observations import read_csv
+from .models import (train_xgb, train_cnn, raw_cnn, platt_fit,
+                     platt_apply, metrics)
+
+
+def unique_rows(responses):
+    """Multiple forecast issuances predict the same future valid hour.
+
+    DO NOT deduplicate by valid timestamp: lead time is a model input.
+    """
+    unique = {}
+    for data in responses:
+        for r in rows_from_data(data):
+            unique[(r['timestamp'], r['run_utc'])] = r
+    return sorted(unique.values(), key=lambda x: (x['timestamp'], x['run_utc']))
+
+
+def split_chronological(pairs, *, gap_hours=MAX_LEAD_HOURS, minimum=150, binary=True):
+    """Order by valid time and purge a >=forecast-horizon gap from val/test.
+
+    This keeps different model runs verifying at the SAME hour in one partition.
+    If a user only supplies sparse observations, detect too little data rather
+    than silently permit leakage. Repeated outcomes within a split are allowed.
+    """
+    if len(pairs) < minimum:
+        raise ValueError(f'Need at least {minimum} usable labeled examples; got {len(pairs)}')
+    times = sorted({p[0]['timestamp'] for p in pairs})
+    if len(times) < 30:
+        raise ValueError('Need at least 30 different observed valid hours')
+    cutoff1 = times[int(len(times) * .70)]
+    cutoff2 = times[int(len(times) * .85)]
+    d1 = datetime.fromisoformat(cutoff1.replace('Z', '+00:00'))
+    d2 = datetime.fromisoformat(cutoff2.replace('Z', '+00:00'))
+    delta = timedelta(hours=gap_hours)
+    dt = lambda r: datetime.fromisoformat(r[0]['timestamp'].replace('Z', '+00:00'))
+    tr = [pair for pair in pairs if dt(pair) < d1 - delta]
+    va = [pair for pair in pairs if d1 <= dt(pair) < d2 - delta]
+    te = [pair for pair in pairs if dt(pair) >= d2]
+    if min(len(tr), len(va), len(te)) < 10:
+        raise ValueError('Not enough independent examples after 72-hour split purge')
+    if binary:
+        for name, split in [('train', tr), ('validation', va), ('test', te)]:
+            if len({int(y) for _, y in split}) < 2:
+                raise ValueError(f'{name} has only one class; collect a longer period/real events')
+    return tr, va, te
+
+
+def arrays(part):
+    return (
+        np.stack([r['features'] for r, _ in part]),
+        np.stack([r['profile'] for r, _ in part]),
+        np.asarray([y for _, y in part], dtype=np.int64),
+    )
+
+
+def summarize_split(trainset, valset, testset):
+    return {
+        'training_rows': len(trainset), 'validation_rows': len(valset),
+        'test_rows': len(testset),
+        'train_valid_time_span_utc': [trainset[0][0]['timestamp'], trainset[-1][0]['timestamp']],
+        'test_valid_time_span_utc': [testset[0][0]['timestamp'], testset[-1][0]['timestamp']],
+    }
+
+
+def read_summit_labels(path):
+    """Only human-verified observations; never fabricate summit visibility."""
+    result = []
+    with open(path, newline='') as f:
+        for raw in csv.DictReader(f):
+            d = datetime.fromisoformat(raw['timestamp'].replace('Z', '+00:00'))
+            if d.tzinfo is None:
+                raise ValueError('Summit timestamps must include UTC offset or Z')
+            key = d.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat().replace('+00:00', 'Z')
+            z = float(raw['target_elevation_ft'])
+            clear = int(raw['observed_summit_clear'])
+            if clear not in (0, 1) or not 5400 <= z <= 11000:
+                raise ValueError('Summit clear must be 0/1 and altitude 5400..11000 ft')
+            result.append((key, z, clear))
+    if len(set((t, z) for t, z, _ in result)) != len(result):
+        raise ValueError('Duplicate summit target hour/elevation')
+    return result
+
+
+def fit_cloud_base(rows, observations, directory, *, min_rows=100):
+    """Optional conditional cloud BASE regression, NOT a cloud TOP predictor."""
+    examples = [(r, observations[r['timestamp']]['cloud_base_ft'])
+                for r in rows if r['timestamp'] in observations
+                and observations[r['timestamp']]['cloud_base_ft'] is not None]
+    if len(examples) < min_rows:
+        return {'available': False, 'reason': f'Only {len(examples)} reported low cloud bases (minimum {min_rows}).'}
+    try:
+        tr, va, te = split_chronological(examples, minimum=min_rows, binary=False)
+    except ValueError as e:
+        return {'available': False, 'reason': str(e)}
+    xtr = np.stack([r['features'] for r, _ in tr])
+    xva = np.stack([r['features'] for r, _ in va])
+    xte = np.stack([r['features'] for r, _ in te])
+    ytr = np.asarray([v for _, v in tr], dtype=float)
+    yva = np.asarray([v for _, v in va], dtype=float)
+    yte = np.asarray([v for _, v in te], dtype=float)
+    reg = XGBRegressor(n_estimators=180, max_depth=3, learning_rate=.04,
+                       subsample=.85, colsample_bytree=.9, tree_method='hist',
+                       n_jobs=4, random_state=42, objective='reg:squarederror')
+    reg.fit(xtr, ytr, verbose=False)
+    residual = np.abs(reg.predict(xva) - yva)
+    # Marginal validation 80% absolute residual band, not a true conditional interval.
+    margin = float(np.quantile(residual, .8))
+    residual_sigma = max(50.0, float(np.std(reg.predict(xva) - yva)))
+    mae = float(mean_absolute_error(yte, reg.predict(xte)))
+    reg.save_model(str(directory / 'cloud_base.json'))
+    return {'available': True, 'target': 'METAR BKN/OVC/VV low cloud BASE ft MSL (not cloud top)',
+            'validation_80pct_abs_residual_ft': round(margin, 1),
+            'validation_residual_sigma_ft': round(residual_sigma, 1),
+            'test_mae_ft': round(mae, 1), 'split': summarize_split(tr, va, te),
+            'warning': 'Only predicts a reported cloud base near KBDU when a low ceiling is reported; cannot infer summit clearance.'}
+
+
+def fit_scenic(rows, observations, labels, directory, *, min_rows=150):
+    """Optional elevation-conditioned classifier for independently labeled scenic event."""
+    if not labels:
+        return {'available': False, 'reason': 'No independently observed summit-clear labels supplied.'}
+    weather_by_valid = {}
+    for row in rows:
+        weather_by_valid.setdefault(row['timestamp'], []).append(row)
+    samples = []
+    for timestamp, elevation, summit_clear in labels:
+        station = observations.get(timestamp)
+        if not station or station['fog'] is None:
+            continue  # Cannot infer a negative from unknown fog.
+        target = int(station['fog'] == 1 and summit_clear == 1)
+        for row in weather_by_valid.get(timestamp, []):
+            newrow = {**row, 'scenic_features': np.append(row['features'], elevation).astype(np.float32)}
+            samples.append((newrow, target))
+    if len(samples) < min_rows:
+        return {'available': False, 'reason': f'Only {len(samples)} independently labeled scenic examples (minimum {min_rows}).'}
+    try:
+        tr, va, te = split_chronological(samples, minimum=min_rows)
+    except ValueError as e:
+        return {'available': False, 'reason': str(e)}
+    xa = lambda part: np.stack([r['scenic_features'] for r, _ in part])
+    ya = lambda part: np.asarray([y for _, y in part])
+    model = train_xgb(xa(tr), ya(tr), xa(va), ya(va))
+    cal = platt_fit(model.predict_proba(xa(va))[:, 1], ya(va))
+    report = metrics(ya(te), platt_apply(model.predict_proba(xa(te))[:, 1], cal))
+    model.save_model(str(directory / 'scenic.json'))
+    # Only publish altitudes with at least 30 independent annotated valid times.
+    unique_per_alt = {float(z): {t for t, z0, _ in labels if z0 == z} for _, z, _ in labels}
+    trained_elevations = sorted(z for z, times in unique_per_alt.items() if len(times) >= 30)
+    return {'available': True, 'trained_elevations_ft': trained_elevations,
+            'target': 'Observed Boulder fog AND independently observed summit clear',
+            'features': list(SCENIC_FEATURE_NAMES), 'calibration': cal,
+            'test_metrics': report, 'split': summarize_split(tr, va, te),
+            'warning': 'Summit-clear observations must be independently audited; altitude interpolation is not validated.'}
+
+
+def train(responses, *, observations, scenic_labels=None, model_dir=MODEL_DIR,
+          cnn_epochs=25, xgb_estimators=300, min_rows=150):
+    """Fail closed: independent labels required. No synthetic/proxy training mode."""
+    if not observations:
+        raise ValueError('Independent METAR observations are required')
+    rows = unique_rows(responses)
+    if not rows:
+        raise ValueError('No usable GFS profiles with valid issue times and 0-72h leads')
+    labeled = [(r, observations[r['timestamp']]['fog']) for r in rows
+               if r['timestamp'] in observations and observations[r['timestamp']]['fog'] is not None]
+    tr, va, te = split_chronological(labeled, minimum=min_rows)
+    xtr, ptr, ytr = arrays(tr)
+    xva, pva, yva = arrays(va)
+    xte, pte, yte = arrays(te)
+    xgb = train_xgb(xtr, ytr, xva, yva, estimators=xgb_estimators)
+    cnn, mean, scale, cnn_info = train_cnn(ptr, ytr, pva, yva, epochs=cnn_epochs)
+    xgb_cal = platt_fit(xgb.predict_proba(xva)[:, 1], yva)
+    cnn_cal = platt_fit(raw_cnn(cnn, pva, mean, scale), yva)
+    xprobs = platt_apply(xgb.predict_proba(xte)[:, 1], xgb_cal)
+    cprobs = platt_apply(raw_cnn(cnn, pte, mean, scale), cnn_cal)
+    ensemble = (xprobs + cprobs) / 2
+    report = {'xgb': metrics(yte, xprobs), 'cnn': metrics(yte, cprobs),
+              'ensemble': metrics(yte, ensemble)}
+    by_lead = {}
+    for lo, hi in ((0, 24), (24, 48), (48, 72)):
+        mask = np.asarray([lo <= r['lead_hours'] < hi for r, _ in te], dtype=bool)
+        if mask.any():
+            by_lead[f'{lo}-{hi}h'] = {'n': int(mask.sum()), **metrics(yte[mask], ensemble[mask])}
+    # A simple forecast-only categorical baseline (not itself calibrated).
+    raw_forecast_flags = np.asarray([
+        int(r['observables']['forecast_visibility_m'] <= 1609) for r, _ in te
+    ], dtype=np.float32)
+    report['raw_gfs_visibility_threshold'] = metrics(yte, raw_forecast_flags)
+    model_dir = Path(model_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    xgb.save_model(str(model_dir / 'xgb.json'))
+    torch.save({'state_dict': cnn.state_dict(),
+                'mean': torch.tensor(mean), 'scale': torch.tensor(scale)},
+               str(model_dir / 'cnn.pt'))
+    base_meta = fit_cloud_base(rows, observations, model_dir, min_rows=100)
+    scenic_meta = fit_scenic(rows, observations, scenic_labels, model_dir, min_rows=min_rows)
+    # Remove stale optional models when retraining cannot support them.
+    for ok, name in [(base_meta['available'], 'cloud_base.json'),
+                     (scenic_meta['available'], 'scenic.json')]:
+        if not ok:
+            (model_dir / name).unlink(missing_ok=True)
+    manifest = {
+        'version': MODEL_VERSION, 'data_model': MODEL_SOURCE,
+        'target': 'observed_airport_fog', 'verified_observations': True,
+        'observation_station': 'KBDU / Boulder Municipal Airport',
+        'max_lead_hours_exclusive': MAX_LEAD_HOURS,
+        'weather_archive': 'Open-Meteo GFS Single Runs (issue-time preserving)',
+        'disclaimer': ('METAR-based fog predictions at Boulder Municipal Airport; not thermodynamic '
+                       'inversion measurements or proven mountain cloud-sea probabilities. '
+                       'Historical forecast availability and independent event frequency limit accuracy.'),
+        'features': list(FEATURE_NAMES), 'channels': list(PROFILE_CHANNELS),
+        'profile_levels': PROFILE_LEVELS, 'profile_top_agl_m': PROFILE_TOP_AGL_M,
+        **summarize_split(tr, va, te),
+        'test_metrics': report, 'test_metrics_by_lead': by_lead,
+        'calibration': {'xgb': xgb_cal, 'cnn': cnn_cal},
+        'cnn_training': cnn_info, 'cloud_base': base_meta, 'scenic': scenic_meta,
+    }
+    (model_dir / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    return manifest
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--start', type=date.fromisoformat, required=True,
+                        help='First historical GFS run UTC date (>=2026-04-02)')
+    parser.add_argument('--end', type=date.fromisoformat, required=True,
+                        help='Last historical GFS run UTC date (no future dates)')
+    parser.add_argument('--observations', type=Path, required=True,
+                        help='CSV generated with python -m inversion.observations')
+    parser.add_argument('--summit-labels', type=Path,
+                        help='Optional human-labeled summit_clear CSV with elevation')
+    parser.add_argument('--run-every-hours', type=int, choices=[6, 12, 24], default=24)
+    parser.add_argument('--history-json', type=Path, help='Offline run-shaped JSON fixtures')
+    parser.add_argument('--epochs', type=int, default=25)
+    parser.add_argument('--model-dir', type=Path, default=MODEL_DIR)
+    args = parser.parse_args()
+    if args.history_json:
+        responses = json.loads(args.history_json.read_text())
+        responses = responses if isinstance(responses, list) else [responses]
+    else:
+        start = datetime.combine(args.start, time(0), timezone.utc)
+        end = datetime.combine(args.end, time(0), timezone.utc)
+        if start < datetime.fromisoformat(ARCHIVE_START).replace(tzinfo=timezone.utc):
+            parser.error(f'GFS single run archive begins {ARCHIVE_START} UTC')
+        if end > datetime.now(timezone.utc) - timedelta(days=3):
+            parser.error('Training runs must be at least 3 days old to have completed verification observations')
+        responses = fetch_archive(start, end, run_every_hours=args.run_every_hours,
+                                  cache_dir=DATA_DIR / 'gfs_runs')
+    result = train(responses, observations=read_csv(args.observations),
+                   scenic_labels=read_summit_labels(args.summit_labels) if args.summit_labels else None,
+                   model_dir=args.model_dir, cnn_epochs=args.epochs)
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == '__main__':
+    main()
+</file>
+
+<file path="inversion/weather.py">
+"""Issue-time-preserving GFS forecast collection. Never train from stitched hindsight."""
+import json
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import requests
+from .config import (BOULDER_LAT, BOULDER_LON, HOURLY_FIELDS,
+                     MODEL_SOURCE, MAX_LEAD_HOURS, ARCHIVE_START)
+
+RUN_URL = 'https://single-runs-api.open-meteo.com/v1/forecast'
+
+
+def utc(dt):
+    if dt.tzinfo is None:
+        raise ValueError('Run initialization requires an explicit timezone')
+    return dt.astimezone(timezone.utc)
+
+
+def run_params(initialization):
+    init = utc(initialization)
+    return {
+        'latitude': BOULDER_LAT, 'longitude': BOULDER_LON,
+        'models': MODEL_SOURCE, 'hourly': ','.join(HOURLY_FIELDS),
+        'timezone': 'UTC', 'temperature_unit': 'celsius',
+        'wind_speed_unit': 'kmh', 'forecast_hours': MAX_LEAD_HOURS,
+        'run': init.strftime('%Y-%m-%dT%H:%M'),
+    }
+
+
+def fetch_run(initialization, *, session=None, cache_dir=None):
+    """Fetch an immutable, uniquely initialized run and cache raw JSON."""
+    init = utc(initialization)
+    if init < datetime.fromisoformat(ARCHIVE_START).replace(tzinfo=timezone.utc):
+        raise ValueError(f'GFS single-run archive does not reach {init.isoformat()}; starts {ARCHIVE_START} UTC')
+    cache_path = None
+    if cache_dir is not None:
+        cache = Path(cache_dir)
+        cache.mkdir(parents=True, exist_ok=True)
+        cache_path = cache / f'gfs_global_{init:%Y%m%dT%H%MZ}_v2.json'
+        if cache_path.exists():
+            data = json.loads(cache_path.read_text())
+            if data.get('_run_utc') != init.isoformat():
+                raise ValueError('Cached run has incorrect initialization')
+            return data
+    client = session if session is not None else requests
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = client.get(RUN_URL, params=run_params(init), timeout=70)
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data.get('hourly'), dict) or not data['hourly'].get('time'):
+                raise ValueError(f'No hourly data in GFS run: {str(data)[:180]}')
+            data['_run_utc'] = init.isoformat()
+            data['_forecast_model'] = MODEL_SOURCE
+            if cache_path:
+                cache_path.write_text(json.dumps(data))
+            return data
+        except (requests.RequestException, ValueError) as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(attempt + 1)
+    raise RuntimeError(f'Cannot fetch GFS run {init.isoformat()}: {last_error}') from last_error
+
+
+def run_times(start, end, *, run_every_hours=24):
+    """Inclusive UTC run initialization range, e.g. 00Z daily or 00/12Z."""
+    if run_every_hours not in (6, 12, 24):
+        raise ValueError('run_every_hours must be 6, 12 or 24, aligned to 00Z')
+    start, end = utc(start), utc(end)
+    cursor = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    while cursor <= end:
+        if cursor >= start:
+            yield cursor
+        cursor += timedelta(hours=run_every_hours)
+
+
+def fetch_archive(start, end, *, run_every_hours=24, cache_dir=None, session=None):
+    return [fetch_run(r, cache_dir=cache_dir, session=session)
+            for r in run_times(start, end, run_every_hours=run_every_hours)]
+
+
+def latest_available_run(*, now=None, session=None, cache_dir=None):
+    """Try completed 6-hourly GFS runs; assume at least 7h dissemination lag.
+
+    There is NO fallback to stitched forecasts: serving with different lead-time
+    semantics would silently invalidate the model. API errors propagate.
+    """
+    now = utc(now or datetime.now(timezone.utc))
+    candidate = (now - timedelta(hours=7)).replace(minute=0, second=0, microsecond=0)
+    candidate = candidate.replace(hour=(candidate.hour // 6) * 6)
+    errors = []
+    for k in range(5):
+        init = candidate - timedelta(hours=6 * k)
+        try:
+            return fetch_run(init, session=session, cache_dir=cache_dir)
+        except (ValueError, RuntimeError) as exc:
+            errors.append(str(exc))
+    raise RuntimeError('No recent initialized GFS run available. ' + '; '.join(errors[-2:]))
+</file>
+
+<file path="models/.gitkeep">
+
+</file>
+
+<file path="tests/test_pipeline.py">
+"""Offline reproducible contract tests; artificial observations are TEST FIXTURES."""
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import math
+import json
+
+import numpy as np
+import pytest
+from fastapi.testclient import TestClient
+
+from inversion.config import HOURLY_FIELDS, PRESSURE_LEVELS, FEATURE_NAMES, MAX_LEAD_HOURS
+from inversion.features import row_at, rows_from_data, uv
+from inversion.observations import (parse_iem_csv, classify_report, observed_cloud_base_ft,
+                                    save_csv, read_csv)
+from inversion.weather import run_params, run_times
+from inversion.train import train, unique_rows, split_chronological
+from inversion.predict import Predictor
+from inversion.server import app
+
+
+def fake_run(issue, *, n=72):
+    h = {'time': [(issue + timedelta(hours=i)).strftime('%Y-%m-%dT%H:%M') for i in range(n)]}
+    for key in HOURLY_FIELDS:
+        h[key] = []
+    for i in range(n):
+        timestamp = issue + timedelta(hours=i)
+        fog = (timestamp.date().toordinal() % 5 == 0 and 3 <= timestamp.hour <= 17)
+        surf = 6 + 7 * math.sin(i / 36)
+        vals = {
+            'temperature_2m': surf,
+            'dew_point_2m': surf - (.6 if fog else 5),
+            'relative_humidity_2m': 96 if fog else 58,
+            'cloud_cover_low': 92 if fog else 17,
+            'cloud_cover_mid': 10 if fog else 55,
+            'cloud_cover_high': 12 if fog else 60,
+            'visibility': 650 if fog else 18000,
+            'boundary_layer_height': 140 if fog else 1250,
+            'weather_code': 45 if fog else 1,
+            'wind_speed_10m': 5 if fog else 20,
+            'wind_direction_10m': 80 if fog else 270,
+        }
+        for p, height in zip(PRESSURE_LEVELS, [1950, 2420, 3000, 3500, 4200]):
+            vals.update({
+                f'temperature_{p}hPa': surf + (2 if fog else -2) - (height - 1950) * .004,
+                f'relative_humidity_{p}hPa': 86 if fog else 45,
+                f'cloud_cover_{p}hPa': 90 if fog and p >= 750 else 14,
+                f'wind_speed_{p}hPa': 12,
+                f'wind_direction_{p}hPa': 85,
+                f'geopotential_height_{p}hPa': height,
+            })
+        for key in HOURLY_FIELDS:
+            h[key].append(vals[key])
+    return {'elevation':1640,'hourly':h,'_run_utc':issue.isoformat(),
+            '_forecast_model':'gfs_global'}
+
+
+def fixture_data(days=80):
+    initial = datetime(2026,5,1,tzinfo=timezone.utc)
+    runs = [fake_run(initial + timedelta(days=d)) for d in range(days)]
+    observations = {}
+    for d in range(days+3):
+        for hour in range(24):
+            at = initial + timedelta(days=d,hours=hour)
+            label = int(at.date().toordinal() % 5 == 0 and 3 <= at.hour <= 17)
+            key = at.isoformat().replace('+00:00','Z')
+            observations[key] = {'fog':label,
+                                 'cloud_base_ft': (5900 + d * 4) if hour in (2, 8, 14, 20) else None}
+    return runs, observations
+
+
+def test_issue_time_schema_and_no_peeking():
+    init=datetime(2026,5,1,tzinfo=timezone.utc)
+    data=fake_run(init,n=76)
+    assert run_params(init)['run']=='2026-05-01T00:00'
+    assert len(rows_from_data(data))==72
+    r=rows_from_data(data)[1]
+    assert r['features'].shape == (len(FEATURE_NAMES),)
+    assert r['profile'].shape == (5,25)
+    assert r['lead_hours']==1
+    assert row_at(data,72) is None
+    data['hourly']['cloud_cover_800hPa'][1] = None
+    assert row_at(data,1) is None
+    assert abs(uv(36,90)[0]+10)<1e-6
+    # Optional GFS boundary-layer-height missing: keep row with explicit NaN.
+    data['hourly']['boundary_layer_height'][2] = None
+    assert np.isnan(row_at(data,2)['features'][7])
+    assert len(list(run_times(init,init+timedelta(days=2))))==3
+    with pytest.raises(ValueError):
+        list(run_times(init,init,run_every_hours=3))
+
+
+def test_metar_records_not_model_labels(tmp_path):
+    csv_text='''# station data\nstation,valid,vsby,skyc1,skyl1,wxcodes\nBDU,2026-06-01 12:06,0.5,OVC,400,FG\nBDU,2026-06-01 13:05,10.0,CLR,M,\nBDU,2026-06-01 14:02,M,BKN,200,\nBDU,2026-06-01 15:01,2.0,CLR,M,\n'''
+    values=parse_iem_csv(csv_text)
+    assert len(values)==4
+    assert [v['observed_fog'] for v in values]==[1,0,'','']
+    assert values[0]['observed_cloud_base_ft_msl']==5688
+    assert observed_cloud_base_ft({'skyc1':'OVC','skyl1':'200'})==5488
+    output=tmp_path/'stations.csv'
+    save_csv(values,output)
+    read=read_csv(output)
+    assert read['2026-06-01T12:00:00Z']['fog']==1
+    assert read['2026-06-01T14:00:00Z']['fog'] is None
+
+
+def test_observations_required_no_proxy():
+    runs, labels = fixture_data(days=3)
+    with pytest.raises(ValueError,match='observations'):
+        train(runs,observations=None)
+    rows=unique_rows(runs)
+    assert len({r['timestamp'] for r in rows}) < len(rows)
+
+
+def test_train_save_predict_and_elevation_targets(tmp_path):
+    runs, obs=fixture_data()
+    # Supply independently-annotated summit clarity, only as synthetic test data.
+    summit=[]
+    for valid, val in obs.items():
+        if valid.endswith('T08:00:00Z') or valid.endswith('T14:00:00Z'):
+            summit.append((valid,8100, int(val['fog']==1)))
+    manifest=train(runs, observations=obs, scenic_labels=summit, model_dir=tmp_path,
+                   cnn_epochs=2, xgb_estimators=25)
+    assert manifest['verified_observations'] is True
+    assert manifest['target']=='observed_airport_fog'
+    assert manifest['cloud_base']['available']
+    assert manifest['scenic']['available']
+    assert {'manifest.json','xgb.json','cnn.pt','cloud_base.json','scenic.json'} <= {x.name for x in tmp_path.iterdir()}
+    results=Predictor(tmp_path).predict(rows_from_data(runs[-1])[:5])
+    assert len(results)==5
+    assert all(0 <= r['probability'] <= 1 for r in results)
+    assert results[0]['cloud_top_ft'] is None
+    assert results[0]['estimated_low_cloud_base_ft_msl'] is not None
+    assert results[0]['landmarks'][-1]['scenic_probability'] is not None
+    assert all(0 <= r['lead_hours'] < 72 for r in results)
+
+
+def test_api_without_models_and_offline_with_models(tmp_path,monkeypatch):
+    from inversion import server
+    monkeypatch.setattr(server,'MODEL_DIR',tmp_path)
+    server._loaded.update(stamp=None,predictor=None)
+    server._cache.update(at=0.0,data=None,stamp=None)
+    client=TestClient(app)
+    assert client.get('/').status_code == 200
+    assert client.get('/dashboard.js').status_code == 200
+    assert client.get('/api/health').json()['trained_models_available'] is False
+    assert client.get('/api/forecast').status_code == 503
+    runs,obs=fixture_data()
+    train(runs, observations=obs, model_dir=tmp_path, cnn_epochs=1,xgb_estimators=20)
+    now=datetime.now(timezone.utc)
+    issue=(now-timedelta(hours=10)).replace(minute=0,second=0,microsecond=0)
+    live=fake_run(issue)
+    monkeypatch.setattr(server,'latest_available_run',lambda **kw: live)
+    result=client.get('/api/forecast')
+    assert result.status_code==200,result.text
+    payload=result.json()
+    assert payload['model']['scenic_available'] is False
+    assert all(h['landmarks'][1]['scenic_probability'] is None for h in payload['hours'])
+    assert len(payload['hours']) > 40
+    assert all(0 <= h['lead_hours'] < 72 for h in payload['hours'])
+    assert client.get('/api/forecast').json()==payload
+</file>
+
+<file path="dashboard.js">
+/**
+     * Atmospheric Model & Coordinates Configuration
+     * Open-Meteo API endpoint for Boulder, CO (40.0150, -105.2705)
+     */
+    const BOULDER_LAT = 40.0150;
+    const BOULDER_LON = -105.2705;
+
+    // Landmark Altitudes in ft MSL
+    const ELEV_BOULDER = 5400;
+    const ELEV_FLATIRON = 7200;
+    const ELEV_GREEN_MT = 8100;
+
+    // State object
+    let state = {
+      isLive: true,
+      rawHourly: null,
+      daysData: [],           // issued-run hours (<72h)
+      selectedDayIdx: 1,      // Default 1 = Tomorrow
+      selectedHourIdx: 6,     // Default to peak hour of selected day
+      chartMode: 'probability' // 'probability' or 'elevation'
+    };
+
+    /**
+     * Presets Data Structure for Instant Testing
+     */
+    const PRESETS = {
+      epic: generateSyntheticDay("Classic Inversion (7,200' & 8,100' Above Fog)", 6700, 92, 2.0, 7.5, 95, 80),
+      high: generateSyntheticDay("High Fog Deck (Only 8,100' Peak Above)", 7600, 84, 1.0, 4.0, 96, 60),
+      socked: generateSyntheticDay("Deep Fog Deck (All 3 Socked In)", 8400, 76, 0.5, -2.0, 98, 40),
+      clear: generateSyntheticDay("Bluebird / Downslope (No Inversion)", 5400, 12, 14.0, 3.0, 30, 270)
+    };
+
+    /**
+     * Window Load Initializer
+     */
+    window.onload = function() {
+      fetchWeatherData();
+    };
+
+    /**
+     * Fetch Live Forecast Data from Open-Meteo API
+     */
+    async function fetchWeatherData(refresh = false) {
+      const refreshIcon = document.getElementById('refreshIcon');
+      refreshIcon.classList.add('fa-spin');
+      try {
+        const response = await fetch(`/api/forecast?refresh=${refresh}`);
+        const payload = await response.json();
+        if (!response.ok) throw new Error(typeof payload.detail === 'string' ? payload.detail : 'Forecast API error');
+        state.savedDays = convertForecast(payload.hours);
+        state.daysData = state.savedDays;
+        state.isLive = true;
+        state.modelInfo = payload.model;
+        state.selectedDayIdx = Math.min(1, state.daysData.length - 1);
+        state.selectedHourIdx = state.daysData[state.selectedDayIdx].peakHour;
+        document.getElementById('apiStatusText').textContent = payload.model.verified_observations
+          ? 'KBDU observed-fog ML (experimental)' : 'Unverified model';
+        document.getElementById('statusBadge').classList.remove('hidden');
+        document.getElementById('modelCaveat').textContent = payload.model.warning;
+        setActivePresetBtn('live');
+        renderSelectedDay();
+      } catch (error) {
+        console.error('Forecast unavailable:', error);
+        document.getElementById('statusBadge').classList.remove('hidden');
+        document.getElementById('apiStatusText').textContent = 'Forecast unavailable';
+        document.getElementById('modelCaveat').textContent = String(error.message);
+        document.getElementById('verdictTitle').textContent = 'Models not available';
+        document.getElementById('verdictDesc').textContent = String(error.message);
+        document.getElementById('probPercent').textContent = '--%';
+        // Never replace a failed live forecast with a seemingly real demo.
+        state.isLive = true;
+        state.daysData = [];
+        document.getElementById('forecastStrip').textContent = 'No live forecast available. Check the model training steps in README.';
+        document.getElementById('hourlyChartSVG').innerHTML = '';
+        document.getElementById('landmarkForecasts').textContent = 'No valid elevation predictions available.';
+        document.getElementById('cloudBaseSummary').textContent = '';
+        document.getElementById('fogRect').setAttribute('opacity','0');
+        document.getElementById('fogTopPuffs').setAttribute('opacity','0');
+        document.getElementById('breakoutLineGroup').style.display = 'none';
+        document.getElementById('clearSkyNotice').style.display = 'block';
+        document.querySelector('#clearSkyNotice text').textContent = 'LIVE FORECAST UNAVAILABLE';
+        ['txtBadgeBoulder','txtBadgeFlatiron','txtBadgeGreenMt'].forEach(id=>{
+          document.getElementById(id).textContent = 'UNVERIFIED';
+        });
+      } finally {
+        refreshIcon.classList.remove('fa-spin');
+      }
+    }
+
+    function convertForecast(hours) {
+      const daysMap = new Map();
+      for (const record of hours) {
+        const date = record.local_time.split('T')[0];
+        if (!daysMap.has(date)) daysMap.set(date, []);
+        const dayHours = daysMap.get(date);
+        const localHour = Number(record.local_time.slice(11, 13));
+        dayHours.push({
+          ...record, idx: dayHours.length, hour: localHour,
+          timeStr: record.local_time.slice(11,16),
+          probability: Math.round(record.probability * 100),
+          xgbScore: Math.round(record.xgb_probability * 100),
+          cnnScore: Math.round(record.cnn_probability * 100),
+          ceiling: null, temp750: null,
+        });
+      }
+      const keys = [...daysMap.keys()].slice(0, 4);
+      return keys.map((dateStr, idx) => {
+        const dayHours = daysMap.get(dateStr);
+        const morning = dayHours.filter(h => h.hour >= 4 && h.hour <= 10);
+        const candidates = morning.length ? morning : dayHours;
+        const best = candidates.reduce((a,b) => a.probability >= b.probability ? a : b);
+        // Date generated at UTC noon to avoid changing calendar day across U.S. zones.
+        const dateObj = new Date(`${dateStr}T12:00:00Z`);
+        return {
+          dateStr, dateObj,
+          dayLabel: idx === 0 ? 'Today' : idx === 1 ? 'Tomorrow' : dateObj.toLocaleDateString('en-US', {weekday:'short',timeZone:'UTC'}),
+          dateFormatted: dateObj.toLocaleDateString('en-US', {month:'numeric',day:'numeric',timeZone:'UTC'}),
+          hours: dayHours, peakHour: best.idx, peakProb: best.probability,
+        };
+      });
+    }
+
+    /**
+     * Render UI for selected day & peak/clicked hour
+     */
+    function renderSelectedDay() {
+      if (!state.daysData || state.daysData.length === 0) return;
+
+      const dayObj = state.daysData[state.selectedDayIdx] || state.daysData[0];
+      
+      // Update Day Label Tags
+      document.getElementById('selectedDateLabel').textContent = `${dayObj.dayLabel} (${dayObj.dateFormatted})`;
+      document.getElementById('chartDayLabel').textContent = `${dayObj.dayLabel} (${dayObj.dateFormatted})`;
+
+      // Find peak hour if not explicitly selected
+      const currentHourData = dayObj.hours[state.selectedHourIdx] || dayObj.hours[dayObj.peakHour] || dayObj.hours[0];
+      state.selectedHourIdx = currentHourData.idx;
+
+      // Update Peak Time Badge
+      const formatTime = (h) => {
+        const ampm = h >= 12 ? 'PM' : 'AM';
+        const h12 = h % 12 === 0 ? 12 : h % 12;
+        return `${h12}:00 ${ampm}`;
+      };
+      
+      const peak = dayObj.hours[dayObj.peakHour];
+      document.getElementById('peakTimeBadge').textContent = `Morning best: ${formatTime(peak.hour)}`;
+      const tz = currentHourData.local_time ?
+        new Intl.DateTimeFormat('en-US',{timeZone:'America/Denver', timeZoneName:'short'}).formatToParts(new Date(currentHourData.timestamp)).find(x=>x.type==='timeZoneName')?.value || 'MT' : 'MT';
+      document.getElementById('currentHourBadge').textContent = `${formatTime(currentHourData.hour)} ${tz}`;
+
+      // Render Gauge & Main Verdict Box
+      renderGaugeAndVerdict(currentHourData);
+
+      // Render SVG Elevation Cross Section Diagram
+      renderSVGDiagram(currentHourData);
+
+      // Render Short-range Outlook Strip
+      render7DayStrip();
+
+      // Render 24-Hour Timeline SVG Chart
+      renderHourlyChart(dayObj);
+
+      // Render Metric Breakdown Cards
+      renderMetricCards(currentHourData);
+      renderLandmarkForecasts(currentHourData);
+
+      // Render Hiking Recommendations Strategy
+      renderHikingPlan(currentHourData);
+    }
+
+    /**
+     * Render Probability Gauge Arc & Verdict Box
+     */
+    function renderGaugeAndVerdict(h) {
+      const probPercent = document.getElementById('probPercent');
+      const gaugeArc = document.getElementById('gaugeArc');
+      const score = h.probability;
+
+      probPercent.textContent = `${score}%`;
+
+      // SVG Circle Gauge Arc calculation (r=50, circumference = 314.15)
+      const circumference = 314.15;
+      const strokeOffset = circumference - (score / 100) * circumference;
+      gaugeArc.style.strokeDashoffset = strokeOffset;
+
+      const badge = document.getElementById('probCategory');
+      const verdictTitle = document.getElementById('verdictTitle');
+      const verdictDesc = document.getElementById('verdictDesc');
+      const verdictIcon = document.getElementById('verdictIcon');
+      const verdictContainer = document.getElementById('verdictIconContainer');
+
+      if (state.isLive) {
+        const label = state.modelInfo?.verified_observations ? 'OBSERVATION-TRAINED ESTIMATE' : 'UNVERIFIED PROXY SCORE';
+        gaugeArc.setAttribute('class', score >= 65 ? 'gauge-circle stroke-emerald-400' : score >= 35 ? 'gauge-circle stroke-cyan-400' : 'gauge-circle stroke-amber-400');
+        badge.className = 'text-[10px] font-bold uppercase tracking-wide text-amber-400 mt-1 px-2 py-1 bg-slate-900 rounded border border-amber-900';
+        badge.textContent = label;
+        verdictTitle.textContent = `XGBoost ${h.xgbScore}% · CNN ${h.cnnScore}%`;
+        verdictDesc.textContent = `Predicted METAR fog at Boulder Municipal Airport, ${h.lead_hours.toFixed(0)}h lead. GFS vertical warming signal: ${h.forecast_inversion_warming_signal ? 'present' : 'not detected'}. Neither proves a thermal inversion or summit visibility.`;
+        verdictIcon.className = 'fa-solid fa-chart-line text-cyan-400';
+        verdictContainer.className = 'p-2.5 rounded-xl bg-cyan-950 text-cyan-400 text-lg flex-shrink-0';
+        return;
+      }
+
+      if (score >= 80) {
+        gaugeArc.setAttribute('class', 'gauge-circle stroke-emerald-400');
+        badge.textContent = "SYNTHETIC CLASSIC SCENARIO";
+        badge.className = "text-xs font-bold uppercase tracking-wider text-emerald-400 mt-1 px-3 py-1 bg-emerald-950/90 rounded-full border border-emerald-700/60";
+
+        verdictTitle.textContent = "Sea of Clouds Over Boulder Valley!";
+        verdictDesc.textContent = `Boulder (5,400') is submerged in thick fog while 1st Flatiron (7,200') and Green Mt (8,100') sit in warm, brilliant sunshine above the deck!`;
+        verdictIcon.className = "fa-solid fa-cloud-sun text-emerald-400";
+        verdictContainer.className = "p-2.5 rounded-xl bg-emerald-950 text-emerald-400 text-lg flex-shrink-0";
+      } else if (score >= 50) {
+        gaugeArc.setAttribute('class', 'gauge-circle stroke-cyan-400');
+        badge.textContent = "SYNTHETIC HIGH SCORE";
+        badge.className = "text-xs font-bold uppercase tracking-wider text-cyan-400 mt-1 px-3 py-1 bg-cyan-950/90 rounded-full border border-cyan-700/60";
+
+        verdictTitle.textContent = "Favorable Cloud Ceiling Setup";
+        verdictDesc.textContent = `Cloud breakout layer estimated around ~${h.ceiling.toLocaleString()} ft. Summit of Green Mt (8,100') will be clear of fog.`;
+        verdictIcon.className = "fa-solid fa-mountain text-cyan-400";
+        verdictContainer.className = "p-2.5 rounded-xl bg-cyan-950 text-cyan-400 text-lg flex-shrink-0";
+      } else if (score >= 25) {
+        gaugeArc.setAttribute('class', 'gauge-circle stroke-amber-400');
+        badge.textContent = "SYNTHETIC MARGINAL";
+        badge.className = "text-xs font-bold uppercase tracking-wider text-amber-400 mt-1 px-3 py-1 bg-amber-950/90 rounded-full border border-amber-700/60";
+
+        verdictTitle.textContent = "Marginal Cloud Ceiling";
+        verdictDesc.textContent = "Cloud deck may be patchy or elevated. Higher peaks may drift in and out of fog.";
+        verdictIcon.className = "fa-solid fa-smog text-amber-400";
+        verdictContainer.className = "p-2.5 rounded-xl bg-amber-950 text-amber-400 text-lg flex-shrink-0";
+      } else {
+        gaugeArc.setAttribute('class', 'gauge-circle stroke-rose-400');
+        badge.textContent = "SYNTHETIC CLEAR SKY";
+        badge.className = "text-xs font-bold uppercase tracking-wider text-rose-400 mt-1 px-3 py-1 bg-rose-950/90 rounded-full border border-rose-700/60";
+
+        const reason = h.windSpeed > 14 ? "Strong downslope Chinook winds blowing out valley moisture." : "Dry atmosphere column with crisp, clear views at all elevations.";
+        verdictTitle.textContent = "Clear Atmosphere (No Cloud Layer)";
+        verdictDesc.textContent = reason;
+        verdictIcon.className = "fa-solid fa-sun text-rose-400";
+        verdictContainer.className = "p-2.5 rounded-xl bg-rose-950 text-rose-400 text-lg flex-shrink-0";
+      }
+    }
+
+    /**
+     * Update Interactive SVG Mountain Cross-Section Diagram
+     */
+    function renderSVGDiagram(h) {
+      const fogRect = document.getElementById('fogRect');
+      const fogPuffs = document.getElementById('fogTopPuffs');
+      const upperCloudPath = document.getElementById('upperCloudPath');
+      const breakoutLineGroup = document.getElementById('breakoutLineGroup');
+      const breakoutText = document.getElementById('breakoutText');
+      const breakoutLine = document.getElementById('breakoutLine');
+      const clearNotice = document.getElementById('clearSkyNotice');
+
+      // SVG Altitude Mapping:
+      // 8,100 ft (Green Mt) -> Y = 95
+      // 7,200 ft (1st Flatiron) -> Y = 150
+      // 5,400 ft (Boulder City) -> Y = 270
+      // Base -> Y = 380
+
+      const score = h.probability;
+      const ceiling = h.ceiling;
+
+      if (state.isLive && ceiling === null) {
+        fogRect.setAttribute('opacity','0');
+        fogPuffs.setAttribute('opacity','0');
+        upperCloudPath.setAttribute('opacity', ((h.midClouds + h.highClouds) / 200) * .8);
+        breakoutLineGroup.style.display = 'none';
+        clearNotice.style.display = 'block';
+        clearNotice.querySelector('text').textContent = 'CLOUD TOP NOT VERIFIED';
+        ['txtBadgeBoulder','txtBadgeFlatiron','txtBadgeGreenMt'].forEach(id=>{
+          document.getElementById(id).textContent = 'UNVERIFIED';
+        });
+        return;
+      }
+      clearNotice.querySelector('text').textContent = 'ILLUSTRATIVE CLEAR SKY';
+
+      // Calculate Fog SVG Y Position
+      // Linear mapping from MSL altitude to SVG Y pixel:
+      // Y = 270 - ((alt - 5400) / (8100 - 5400)) * (270 - 95)
+      let fogY = 270 - ((ceiling - 5400) / 2700) * 175;
+      let opacity = (h.lowClouds / 100) * 0.9;
+
+      if (score < 20) {
+        // Low probability -> Clear air mode
+        opacity = 0.0;
+        fogY = 350;
+        clearNotice.style.display = 'block';
+        breakoutLineGroup.style.display = 'none';
+      } else {
+        clearNotice.style.display = 'none';
+        breakoutLineGroup.style.display = 'block';
+      }
+
+      // Update Fog Rect & Puffs
+      fogRect.setAttribute('y', fogY);
+      fogRect.setAttribute('height', 380 - fogY);
+      fogRect.setAttribute('opacity', opacity);
+
+      fogPuffs.setAttribute('d', `M 0,${fogY} Q 50,${fogY-15} 100,${fogY} T 200,${fogY} T 300,${fogY} T 400,${fogY} T 500,${fogY} T 600,${fogY} T 700,${fogY} T 800,${fogY} L 800,380 L 0,380 Z`);
+      fogPuffs.setAttribute('opacity', opacity > 0 ? 0.65 : 0);
+
+      // Upper Mid/High Cloud Layer
+      const avgUpper = (h.midClouds + h.highClouds) / 2;
+      upperCloudPath.setAttribute('opacity', (avgUpper / 100) * 0.85);
+
+      // Breakout Line & Text
+      if (score >= 20) {
+        breakoutLine.setAttribute('y1', fogY);
+        breakoutLine.setAttribute('y2', fogY);
+        document.getElementById('breakoutLabelBg').setAttribute('y', fogY - 12);
+        breakoutText.setAttribute('y', fogY + 2);
+        breakoutText.textContent = `Estimated Cloud Top: ~${ceiling.toLocaleString()} ft MSL`;
+      }
+
+      // Dynamic Landmark Status Badges (In Fog vs Above Fog vs Clear Sky)
+      updateLandmarkBadge('txtBadgeBoulder', 'badgeBoulder', ELEV_BOULDER, ceiling, score);
+      updateLandmarkBadge('txtBadgeFlatiron', 'badgeFlatiron', ELEV_FLATIRON, ceiling, score);
+      updateLandmarkBadge('txtBadgeGreenMt', 'badgeGreenMt', ELEV_GREEN_MT, ceiling, score);
+    }
+
+    /**
+     * Helper to style landmark badges on SVG (In Fog / Above Clouds)
+     */
+    function updateLandmarkBadge(txtId, groupId, landmarkAlt, cloudCeiling, score) {
+      const txtNode = document.getElementById(txtId);
+      const groupNode = document.getElementById(groupId);
+      if (!txtNode || !groupNode) return;
+
+      const rectNode = groupNode.querySelector('rect');
+
+      if (score < 20) {
+        txtNode.textContent = "☀️ CLEAR SKY";
+        txtNode.setAttribute('fill', '#fde047');
+        rectNode.setAttribute('fill', '#451a03');
+        rectNode.setAttribute('stroke', '#f59e0b');
+      } else if (cloudCeiling >= landmarkAlt) {
+        txtNode.textContent = "☁️ IN FOG";
+        txtNode.setAttribute('fill', '#e2e8f0');
+        rectNode.setAttribute('fill', '#1e293b');
+        rectNode.setAttribute('stroke', '#64748b');
+      } else {
+        txtNode.textContent = "☀️ ABOVE CLOUDS";
+        txtNode.setAttribute('fill', '#34d399');
+        rectNode.setAttribute('fill', '#064e3b');
+        rectNode.setAttribute('stroke', '#10b981');
+      }
+    }
+
+    /**
+     * Render Short-range Outlook Strip
+     */
+    function render7DayStrip() {
+      const strip = document.getElementById('forecastStrip');
+      strip.innerHTML = '';
+
+      state.daysData.forEach((day, idx) => {
+        const isSelected = idx === state.selectedDayIdx;
+        const score = day.peakProb;
+
+        let scoreClass = "bg-rose-950/60 text-rose-400 border-rose-800/40";
+        let iconClass = "fa-sun text-amber-400";
+        if (score >= 75) {
+          scoreClass = "bg-emerald-950/80 text-emerald-300 border-emerald-700/60";
+          iconClass = "fa-cloud-sun text-emerald-400";
+        } else if (score >= 45) {
+          scoreClass = "bg-cyan-950/80 text-cyan-300 border-cyan-700/60";
+          iconClass = "fa-smog text-cyan-400";
+        }
+
+        const borderClass = isSelected ? "border-cyan-400 bg-cyan-950/40 ring-1 ring-cyan-400/50 shadow-lg" : "border-slate-800 bg-slate-900/80 hover:border-slate-700";
+
+        const cardHtml = `
+          <div onclick="selectDay(${idx})" class="cursor-pointer border rounded-2xl p-3 flex flex-col justify-between items-center text-center transition ${borderClass}">
+            <div>
+              <div class="text-xs font-bold ${isSelected ? 'text-cyan-300' : 'text-slate-200'}">${day.dayLabel}</div>
+              <div class="text-[10px] text-slate-400 font-mono">${day.dateFormatted}</div>
+            </div>
+
+            <div class="my-2.5 flex flex-col items-center">
+              <i class="fa-solid ${iconClass} text-lg my-1"></i>
+              <span class="text-xl font-black font-mono text-white">${score}%</span>
+            </div>
+
+            <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border ${scoreClass} w-full truncate">
+              ${score >= 75 ? 'Epic' : score >= 45 ? 'Moderate' : 'Unlikely'}
+            </span>
+          </div>
+        `;
+
+        strip.innerHTML += cardHtml;
+      });
+    }
+
+    /**
+     * Render 24-Hour Timeline SVG Chart (Probability OR Elevation Mode)
+     */
+    function renderHourlyChart(dayObj) {
+      const svg = document.getElementById('hourlyChartSVG');
+      const hours = dayObj.hours;
+      const showProb = state.chartMode === 'probability';
+      const left = 52, top = 18, height = 172, width = 826;
+      const barWidth = width / hours.length;
+      let content = '';
+      [0,25,50,75,100].forEach(v => {
+        const y = top + height - v / 100 * height;
+        content += `<line x1="${left}" y1="${y}" x2="890" y2="${y}" stroke="#334155" stroke-dasharray="3 4" />`;
+        content += `<text x="45" y="${y+4}" font-size="10" fill="#94a3b8" text-anchor="end">${v}%</text>`;
+      });
+      hours.forEach((h,idx) => {
+        const val = showProb ? h.probability : h.lowClouds;
+        const barHeight = Math.max(0,Math.min(100,val)) / 100 * height;
+        const x = left + idx*barWidth;
+        const y = top + height - barHeight;
+        const selected = idx === state.selectedHourIdx;
+        content += `<rect onclick="selectHour(${idx})" x="${x+2}" y="${y}" width="${Math.max(3,barWidth-4)}" height="${barHeight}" rx="3" fill="${selected ? '#fbbf24' : showProb ? '#06b6d4' : '#94a3b8'}" opacity="${selected?1:0.78}" class="chart-bar-hover"><title>${h.timeStr}: ${Math.round(val)}%</title></rect>`;
+        if (idx % 3 === 0) content += `<text x="${x+barWidth/2}" y="225" font-size="10" text-anchor="middle" fill="#94a3b8">${h.timeStr}</text>`;
+      });
+      svg.innerHTML = content;
+      const current = hours[state.selectedHourIdx] || hours[0];
+      document.getElementById('chartSelectedHourInfo').textContent =
+        `${current.timeStr} · Ensemble ${current.probability}% · Low clouds ${Math.round(current.lowClouds)}%`;
+    }
+
+    /**
+     * Set Chart View Mode (Probability vs Elevation)
+     */
+    function setChartMode(mode) {
+      state.chartMode = mode;
+      const btnProb = document.getElementById('btnModeProb');
+      const btnElev = document.getElementById('btnModeElev');
+
+      if (mode === 'probability') {
+        btnProb.className = "px-4 py-2 rounded-xl text-xs font-bold transition flex items-center space-x-2 bg-cyan-950 text-cyan-300 border border-cyan-800/80 shadow";
+        btnElev.className = "px-4 py-2 rounded-xl text-xs font-bold transition flex items-center space-x-2 text-slate-400 hover:text-white";
+      } else {
+        btnElev.className = "px-4 py-2 rounded-xl text-xs font-bold transition flex items-center space-x-2 bg-amber-950 text-amber-300 border border-amber-800/80 shadow";
+        btnProb.className = "px-4 py-2 rounded-xl text-xs font-bold transition flex items-center space-x-2 text-slate-400 hover:text-white";
+      }
+
+      renderSelectedDay();
+    }
+
+    /**
+     * User clicks a day in the 72-hour strip
+     */
+    function selectDay(dayIdx) {
+      state.selectedDayIdx = dayIdx;
+      const dayObj = state.daysData[dayIdx];
+      state.selectedHourIdx = dayObj ? dayObj.peakHour : 0;
+      renderSelectedDay();
+    }
+
+    /**
+     * User clicks an hour on the 24-hour chart
+     */
+    function selectHour(idx) {
+      state.selectedHourIdx = idx;
+      renderSelectedDay();
+    }
+
+    /**
+     * Render Metric Breakdown Cards
+     */
+    function renderMetricCards(h) {
+      document.getElementById('metricLowClouds').textContent = `${h.lowClouds}%`;
+      document.getElementById('barLowClouds').style.width = `${h.lowClouds}%`;
+
+      const upperClear = Math.max(0, Math.round(100 - (h.midClouds + h.highClouds)/2));
+      document.getElementById('metricClearSky').textContent = `${upperClear}%`;
+      document.getElementById('barClearSky').style.width = `${upperClear}%`;
+
+      const delta = h.tempDelta.toFixed(1);
+      document.getElementById('metricTempDelta').textContent = `${delta > 0 ? '+' : ''}${delta}°C`;
+      document.getElementById('valSurfTemp').textContent = `${h.surfTemp}°C`;
+      document.getElementById('valHighTemp').textContent = h.temp750 === null ? 'Unavailable' : `${h.temp750}°C`;
+
+      document.getElementById('metricWindSpeed').textContent = `${h.windSpeed} mph`;
+      document.getElementById('metricWindDir').textContent = getWindDirAbbr(h.windDir);
+      document.getElementById('windArrow').style.transform = `rotate(${h.windDir}deg)`;
+
+      const windQuality = (h.windDir >= 40 && h.windDir <= 140) ? Math.min(100, (15 - h.windSpeed) * 8) : 25;
+      document.getElementById('barWind').style.width = `${Math.max(10, windQuality)}%`;
+    }
+
+    /** Altitude is an explicit target, but do not fabricate summit-clear odds. */
+    function renderLandmarkForecasts(h) {
+      const panel = document.getElementById('landmarkForecasts');
+      const caption = document.getElementById('cloudBaseSummary');
+      if (!panel || !caption) return;
+      if (!state.isLive) {
+        panel.textContent = 'Synthetic scenario; no validated mountain probabilities.';
+        caption.textContent = '';
+        return;
+      }
+      const sites = h.landmarks || [];
+      panel.replaceChildren();
+      sites.forEach(site => {
+        const block = document.createElement('div');
+        block.className = 'bg-slate-900 border border-slate-700 rounded-xl p-3';
+        const name = document.createElement('div');
+        name.className = 'text-sm font-bold text-slate-200';
+        name.textContent = `${site.name} · ${site.elevation_ft.toLocaleString()} ft`;
+        const score = document.createElement('div');
+        score.className = 'text-lg font-bold text-cyan-300 mt-2';
+        score.textContent = site.scenic_probability === null ? 'Not trained' : `${Math.round(site.scenic_probability * 100)}%`;
+        const explanation = document.createElement('p');
+        explanation.className = 'text-xs text-slate-400 mt-1';
+        explanation.textContent = site.scenic_probability === null
+          ? 'Requires verified summit-clear observations.'
+          : 'Observed-fog AND observed-summit-clear training target; still experimental.';
+        block.append(name, score, explanation);
+        panel.appendChild(block);
+      });
+      const b = h.estimated_low_cloud_base_ft_msl;
+      const range = h.cloud_base_80pct_residual_interval_ft_msl;
+      caption.textContent = b === null ? 'Airport cloud-base regression unavailable: too few reported ceilings.'
+        : `Estimated low-cloud BASE near KBDU: ${b.toLocaleString()} ft MSL` +
+          (range ? ` (validation 80% absolute-residual band: ${range[0].toLocaleString()}–${range[1].toLocaleString()} ft).` : '.') +
+          ' This is NOT the top of the cloud layer or a guarantee of a clear peak.';
+    }
+
+    /**
+     * Render Hiking & Landmark Recommendations Strategy
+     */
+    function renderHikingPlan(h) {
+      const alarm = document.getElementById('recAlarmTime');
+      const thTitle = document.getElementById('recTrailheadTitle');
+      const thDesc = document.getElementById('recTrailheadDesc');
+      const boTitle = document.getElementById('recBreakoutTitle');
+      const boDesc = document.getElementById('recBreakoutDesc');
+      const gearTitle = document.getElementById('recGearTitle');
+      const gearDesc = document.getElementById('recGearDesc');
+
+      const score = h.probability;
+      const ceiling = h.ceiling;
+
+      if (state.isLive && ceiling === null) {
+        alarm.textContent = 'Use local sunrise / trail conditions';
+        thTitle.textContent = 'Check webcams and local observations';
+        thDesc.textContent = 'A model forecast cannot guarantee you will climb above fog. Check current cloud bases, visibility, wind and trail conditions.';
+        boTitle.textContent = h.estimated_low_cloud_base_ft_msl !== null ? `Reported-cloud-base estimate ~${Math.round(h.estimated_low_cloud_base_ft_msl).toLocaleString()} ft MSL` : 'Cloud-base and cloud-top unavailable';
+        boDesc.textContent = 'The elevation model estimates the base of a low cloud layer at KBDU when such a ceiling is reported. The top of the deck and summit clearance remain unknown unless independently trained.';
+        gearTitle.textContent = 'Prepare for uncertain conditions';
+        gearDesc.textContent = 'Carry a headlamp, warm and windproof layers, and navigation. Avoid committing to a hike based on this experimental score alone.';
+        return;
+      }
+
+      if (score >= 70) {
+        alarm.textContent = "5:15 AM MDT";
+        thTitle.textContent = "1st Flatiron Ridge or Green Mt";
+        thDesc.textContent = "Start at Chautauqua Ranger Cottage and hike up Gregory Canyon to break out above the 6,700' fog deck early.";
+
+        boTitle.textContent = `Cloud Ceiling: ~${ceiling.toLocaleString()} ft MSL`;
+        boDesc.textContent = "Boulder (5,400') submerged in dense fog; 1st Flatiron (7,200') and Green Mt (8,100') are in full warm sunshine!";
+
+        gearTitle.textContent = "High-Contrast Photography Pack";
+        gearDesc.textContent = "Headlamp required for lower fog trail. Pack sunglasses and ND filter for golden hour over the sea of clouds.";
+      } else if (score >= 40) {
+        alarm.textContent = "5:45 AM MDT";
+        thTitle.textContent = "Green Mountain Summit Target";
+        thDesc.textContent = "Higher cloud ceiling today (~7,500'). Target Green Mountain Summit (8,100') for guaranteed clear mountain views.";
+
+        boTitle.textContent = `Cloud Ceiling: ~${ceiling.toLocaleString()} ft MSL`;
+        boDesc.textContent = "Boulder and 1st Flatiron enveloped in fog; Green Mt summit breaks out above the cloud line.";
+
+        gearTitle.textContent = "Damp Trail & Moisture Layering";
+        gearDesc.textContent = "Pack waterproof shell for damp lower trail and headlamp for early morning start.";
+      } else {
+        alarm.textContent = "7:30 AM / Regular Hike";
+        thTitle.textContent = "Standard Day Hike (Clear Air)";
+        thDesc.textContent = "Inversion deck unlikely today. Crisp mountain views expected at all elevations.";
+
+        boTitle.textContent = "No Cloud Inversion Ceiling";
+        boDesc.textContent = "Valley floor, 1st Flatiron, and Green Mt all share clear atmospheric visibility.";
+
+        gearTitle.textContent = "Standard Daypack Essentials";
+        gearDesc.textContent = "Standard daylight hiking gear. Check wind advisory if strong westerly downslope winds are present.";
+      }
+    }
+
+    /**
+     * Generate Synthetic 24-hour day for testing Presets
+     */
+    function generateSyntheticDay(name, targetCeiling, targetProb, surfT, t750, lowC, wDir) {
+      const hours = [];
+      for (let h = 0; h < 24; h++) {
+        const isMorning = (h >= 5 && h <= 9);
+        const prob = isMorning ? targetProb : Math.max(10, targetProb - Math.abs(h - 7) * 9);
+        const ceiling = targetProb < 20 ? 5400 : targetCeiling;
+
+        hours.push({
+          hour: h,
+          idx: h,
+          timeStr: `${h.toString().padStart(2, '0')}:00`,
+          lowClouds: isMorning ? lowC : 30,
+          midClouds: 10,
+          highClouds: 5,
+          surfTemp: surfT,
+          dewPoint: surfT - 1.0,
+          rh: 90,
+          temp750: t750,
+          tempDelta: t750 - surfT,
+          windSpeed: 5,
+          windDir: wDir,
+          probability: prob,
+          ceiling: ceiling
+        });
+      }
+
+      const dateObj = new Date();
+      return [{
+        dateStr: dateObj.toISOString().split('T')[0],
+        dateObj: dateObj,
+        dayLabel: 'Preset Scenario',
+        dateFormatted: name,
+        hours: hours,
+        peakHour: 7,
+        peakProb: targetProb
+      }];
+    }
+
+    /**
+     * Load Atmospheric Preset Scenario
+     */
+    function loadPreset(key) {
+      setActivePresetBtn(key);
+      if (key === 'live') {
+        if (state.savedDays?.length) {
+          state.isLive = true;
+          state.daysData = state.savedDays;
+          state.selectedDayIdx = Math.min(1, state.daysData.length-1);
+          state.selectedHourIdx = state.daysData[state.selectedDayIdx].peakHour;
+          renderSelectedDay();
+        } else fetchWeatherData();
+        return;
+      }
+      const presetData = PRESETS[key];
+      if (presetData) {
+        state.isLive = false;
+        state.daysData = presetData;
+        state.selectedDayIdx = 0;
+        state.selectedHourIdx = 7;
+        document.getElementById('modelCaveat').textContent = 'DEMONSTRATION SCENARIO — all values and cloud layers are synthetic.';
+        document.getElementById('apiStatusText').textContent = 'Synthetic demo scenario';
+        renderSelectedDay();
+      }
+    }
+
+    function setActivePresetBtn(activeKey) {
+      document.querySelectorAll('.preset-btn').forEach(btn => {
+        btn.className = "preset-btn px-3 py-1.5 rounded-xl font-medium border border-slate-700 bg-slate-900 text-slate-300 hover:border-slate-500 transition";
+      });
+      const activeBtn = document.getElementById(`btn-${activeKey}`);
+      if (activeBtn) {
+        activeBtn.className = "preset-btn px-3 py-1.5 rounded-xl font-medium border border-cyan-500 bg-cyan-950/80 text-cyan-300 shadow-sm transition";
+      }
+    }
+
+    function getWindDirAbbr(deg) {
+      const dirs = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+      return dirs[Math.floor((deg / 22.5) + 0.5) % 16];
+    }
+</file>
+
+<file path="requirements-dev.txt">
+-r requirements.txt
+pytest>=8,<10
+httpx>=0.27,<1
 </file>
 
 <file path=".gitignore">
@@ -243,115 +2014,28 @@ dist/
 .env
 .env.local
 *.log
+
+# Large/raw locally fetched historical data and generated model artifacts
+__pycache__/
+.pytest_cache/
+.venv/
+*.pyc
+data/raw/
+data/gfs_runs/
+data/*.csv
+</file>
+
+<file path="dl_inversion.py">
+"""Compatibility entry point; implementation lives in inversion.models/train."""
+from inversion.models import ProfileCNN, train_cnn
+from inversion.train import main
+
+if __name__ == '__main__':
+    main()
 </file>
 
 <file path="guide.html">
-<!DOCTYPE html>
-<html lang="en" class="dark">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>User Guide | Boulder Inversion Tracker</title>
-  
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = {
-      darkMode: 'class',
-      theme: {
-        extend: {
-          colors: {
-            alpine: { 900: '#080c14', 800: '#0f172a', 700: '#1e293b', 600: '#334155', cyan: '#06b6d4' }
-          },
-          fontFamily: {
-            sans: ['Inter', 'sans-serif'],
-            mono: ['JetBrains Mono', 'monospace'],
-          }
-        }
-      }
-    }
-  </script>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-  <style>
-    body { font-family: 'Inter', sans-serif; background-color: #060911; color: #f8fafc; }
-    .glass-card { background: rgba(15, 23, 42, 0.78); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); }
-    ::-webkit-scrollbar { width: 6px; }
-    ::-webkit-scrollbar-track { background: #0b1120; }
-    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
-  </style>
-</head>
-<body class="min-h-screen text-slate-100 flex flex-col justify-between selection:bg-cyan-500 selection:text-slate-950">
-
-  <!-- TOP HEADER -->
-  <header class="border-b border-slate-800/80 bg-slate-950/90 sticky top-0 z-50 backdrop-blur-md">
-    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-      <div class="flex items-center space-x-3">
-        <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-cyan-600 to-amber-500 flex items-center justify-center">
-          <i class="fa-solid fa-book-open text-slate-950 text-xl font-bold"></i>
-        </div>
-        <div>
-          <h1 class="font-extrabold text-lg bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">User Guide</h1>
-          <p class="text-xs text-slate-400">How to navigate the predictor</p>
-        </div>
-      </div>
-      <!-- Navigation Links -->
-      <nav class="flex space-x-4 text-sm font-semibold">
-        <a href="index.html" class="text-slate-400 hover:text-cyan-400 transition"><i class="fa-solid fa-chart-line mr-1"></i>Dashboard</a>
-        <a href="guide.html" class="text-cyan-400"><i class="fa-solid fa-book-open mr-1"></i>Guide</a>
-        <a href="science.html" class="text-slate-400 hover:text-cyan-400 transition"><i class="fa-solid fa-flask mr-1"></i>Science</a>
-      </nav>
-    </div>
-  </header>
-
-  <main class="max-w-4xl mx-auto px-4 py-8 space-y-8 flex-grow">
-    
-    <section class="glass-card rounded-3xl p-8">
-      <h2 class="text-2xl font-extrabold text-white mb-4 border-b border-slate-700 pb-2">What is this Dashboard?</h2>
-      <p class="text-slate-300 leading-relaxed mb-4">
-        The Boulder Inversion Tracker is a highly specialized meteorological tool designed for photographers, hikers, and weather enthusiasts in Boulder, Colorado. It predicts the exact probability and elevation of temperature inversions—the phenomenon that traps the city in a dense fog deck while upper elevations sit under clear blue skies[cite: 3].
-      </p>
-      <p class="text-slate-300 leading-relaxed">
-        The dashboard uses a 3-level elevation profile comparing the <strong>City of Boulder (5,400 ft)</strong>, the <strong>1st Flatiron (7,200 ft)</strong>, and the <strong>Green Mountain Summit (8,100 ft)</strong> to determine which locations will be above the clouds[cite: 3].
-      </p>
-    </section>
-
-    <section class="glass-card rounded-3xl p-8">
-      <h2 class="text-2xl font-extrabold text-white mb-4 border-b border-slate-700 pb-2">Understanding the Terminology (Presets)</h2>
-      <ul class="space-y-4 text-slate-300">
-        <li><strong class="text-cyan-400"><i class="fa-solid fa-satellite-dish mr-2"></i>Live Forecast:</strong> Pulls real-time atmospheric sounding data to give you the current 7-day outlook[cite: 3].</li>
-        <li><strong class="text-emerald-400"><i class="fa-solid fa-trophy mr-2"></i>Classic Inversion:</strong> The "holy grail" setup. The cloud ceiling stops around 6,700 ft. The city is foggy, but if you hike to the 1st Flatiron or Green Mountain, you will break through the clouds into the sunshine[cite: 3].</li>
-        <li><strong class="text-amber-400"><i class="fa-solid fa-cloud mr-2"></i>High Deck:</strong> A deeper moisture layer. The fog ceiling rises to around 7,500 ft. The 1st Flatiron is stuck in the fog, and only the very top of Green Mountain sits above the clouds[cite: 3].</li>
-        <li><strong class="text-blue-400"><i class="fa-solid fa-smog mr-2"></i>Socked In:</strong> The moisture layer is very deep (above 8,100 ft). All three landmarks (City, Flatiron, Green Mountain) are trapped inside the cloud layer[cite: 3].</li>
-        <li><strong class="text-rose-400"><i class="fa-solid fa-sun mr-2"></i>Bluebird / Downslope:</strong> No inversion exists. The air is either very dry, or strong westerly winds (Chinooks) have blown the moisture away, resulting in clear air everywhere[cite: 3].</li>
-      </ul>
-    </section>
-
-    <section class="glass-card rounded-3xl p-8">
-      <h2 class="text-2xl font-extrabold text-white mb-4 border-b border-slate-700 pb-2">How to Use the Interactive Charts</h2>
-      <div class="space-y-6">
-        <div>
-          <h3 class="text-lg font-bold text-emerald-300 mb-2">1. The 3D Elevation Cross-Section</h3>
-          <p class="text-slate-300 text-sm">
-            This diagram visually maps the estimated cloud top against Boulder's terrain. It features dynamic tags that tell you whether each of the 3 landmarks is currently <strong>☁️ IN FOG</strong> or <strong>☀️ ABOVE CLOUDS</strong>[cite: 3]. When inversion probability drops below 20%, the fog disappears and a yellow "Clear Mountain Air" banner displays[cite: 3].
-          </p>
-        </div>
-        <div>
-          <h3 class="text-lg font-bold text-cyan-300 mb-2">2. The 7-Day Interactive Strip</h3>
-          <p class="text-slate-300 text-sm">
-            Click on any day in the 7-day strip. Doing so will recalculate the entire page for that specific day's peak inversion window, updating the gauge, metrics, and diagrams[cite: 3].
-          </p>
-        </div>
-        <div>
-          <h3 class="text-lg font-bold text-amber-300 mb-2">3. The 24-Hour Diurnal Timeline</h3>
-          <p class="text-slate-300 text-sm">
-            Located below the 7-day outlook, this chart lets you scrub through the day hour-by-hour. You can toggle between viewing the <strong>Inversion Probability (%)</strong> and the estimated <strong>Cloud Top Elevation (ft)</strong>[cite: 3]. Click on any bar in this chart, and the 3D Elevation Cross-Section above will instantly animate to show the conditions for that exact hour[cite: 3].
-          </p>
-        </div>
-      </div>
-    </section>
-  </main>
-</body>
-</html>
+<!DOCTYPE html><html lang="en" class="dark"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Guide | Boulder Inversion Tracker</title><script src="https://cdn.tailwindcss.com"></script><style>body{background:#060911;color:#e2e8f0;font-family:system-ui,sans-serif}.card{background:#0f172a;border:1px solid #334155;border-radius:20px;padding:28px}a{color:#67e8f9}</style></head><body><header class="border-b border-slate-700 p-5"><nav class="max-w-4xl mx-auto flex justify-between"><strong>Boulder Inversion Tracker — Guide</strong><div class="space-x-5"><a href="/">Dashboard</a><a href="/science.html">Science</a></div></nav></header><main class="max-w-4xl mx-auto p-6 space-y-6"><section class="card space-y-2"><h1 class="text-2xl font-bold">Understanding the short-range tracker</h1><p>The live dashboard shows estimates for airport fog conditions from an initialized GFS run. Forecast lead times are strictly less than 72 hours from model initialization. Because model results are not distributed instantaneously, the remaining future window may be shorter than three days.</p><p>Forecast probabilities are experimental and only valid to the extent independently observed verification supports them. The first model uses reports from Boulder Municipal Airport (KBDU), not photos from the Flatirons.</p></section><section class="card space-y-2"><h2 class="text-xl font-bold">Reading the probability and charts</h2><p>The large percentage is the average of an XGBoost model and a small CNN estimating a conservatively defined reported airport fog event. The models receive numerical weather predictions of surface humidity, visibility, cloud cover, winds and vertical structure. Click a day or an hourly bar to inspect a specific forecast valid time. The other chart mode shows predicted low-cloud coverage, not a measured cloud-top height.</p></section><section class="card space-y-2"><h2 class="text-xl font-bold">Elevation-specific outlook</h2><p>Each landmark is shown at its target elevation. If sufficient independently observed summit conditions were provided during training, an elevation-conditioned scenic-event model returns an estimate. Otherwise it says <strong>Not trained</strong>. If enough reported low cloud bases exist, a separate regression model estimates the airport low-cloud <strong>base</strong> altitude, not the cloud-top or safe breakout elevation.</p><p>Do not use airport fog probability as a guarantee that Boulder is covered while Green Mountain is sunny. The diagram is schematic and does not indicate observed summit clearance.</p></section><section class="card space-y-2"><h2 class="text-xl font-bold">Synthetic presets</h2><p>Classic, high, socked and clear presets are illustrative examples only. Their numbers and cloud layers are invented to test the interface. The live mode never replaces a failed data request with a synthetic prediction.</p></section><section class="card space-y-2"><h2 class="text-xl font-bold">For contributors</h2><p>See the <a href="https://github.com/samadler8/invert-boulder">README</a> for collecting independent airport METAR observations, retrieving issue-time-preserved GFS runs, training the models, adding summit observations, and running the local FastAPI server. Current provider data may be sparse for rare fog cases. The model refuses to train when it cannot validate both classes.</p></section></main></body></html>
 </file>
 
 <file path="index.html">
@@ -478,7 +2162,7 @@ dist/
               Boulder Inversion Tracker
             </h1>
             <span class="text-[10px] bg-cyan-950 text-cyan-400 border border-cyan-800/60 font-semibold px-2 py-0.5 rounded-full uppercase tracking-wider">
-              3-Level Elevation Profile
+              Illustrative 3-Level Profile
             </span>
           </div>
           <p class="text-xs text-slate-400 flex items-center space-x-1.5">
@@ -498,10 +2182,10 @@ dist/
             <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
             <span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
           </span>
-          <span id="apiStatusText" class="text-slate-300 font-medium">Open-Meteo Synced</span>
+          <span id="apiStatusText" class="text-slate-300 font-medium">Not yet loaded</span>
         </div>
 
-        <button onclick="fetchWeatherData()" class="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition shadow-sm" title="Refresh Live Data">
+        <button onclick="fetchWeatherData(true)" class="p-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition shadow-sm" title="Refresh Live Data">
           <i class="fa-solid fa-rotate-right text-sm" id="refreshIcon"></i>
         </button>
       </div>
@@ -512,11 +2196,13 @@ dist/
   <!-- MAIN APPLICATION CONTAINER -->
   <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6 flex-grow w-full">
 
+    <p id="modelCaveat" role="status" class="text-xs text-amber-300 bg-slate-900/80 border border-amber-900/70 rounded-xl p-3">Loading local model. These scores should not be treated as measured or calibrated inversion probabilities.</p>
+
     <!-- PRESET TESTER BAR -->
     <section class="glass-card rounded-2xl p-3 flex flex-wrap items-center justify-between gap-3 border-cyan-900/40">
       <div class="flex items-center space-x-2 text-xs font-bold uppercase tracking-wider text-slate-400 pl-2">
         <i class="fa-solid fa-sliders text-cyan-400"></i>
-        <span>Atmospheric Presets:</span>
+        <span>Synthetic UI demos (not forecasts):</span>
       </div>
       
       <div class="flex flex-wrap items-center gap-2 text-xs">
@@ -549,12 +2235,12 @@ dist/
         <!-- Header info -->
         <div class="flex items-center justify-between z-10">
           <div>
-            <span class="text-xs font-bold tracking-widest text-cyan-400 uppercase" id="selectedDateLabel">Tomorrow Peak Time</span>
-            <h2 class="text-xl font-extrabold text-white mt-0.5">Inversion Probability</h2>
+            <span class="text-xs font-bold tracking-widest text-cyan-400 uppercase" id="selectedDateLabel">Awaiting live forecast</span>
+            <h2 class="text-xl font-extrabold text-white mt-0.5">Low-fog Opportunity Score</h2>
           </div>
           <div class="text-right">
-            <span class="text-xs text-amber-400 font-mono font-bold block" id="peakTimeBadge">Peak: 6:30 AM</span>
-            <span class="text-[10px] text-slate-400 block" id="peakSubText">Optimal Viewing Window</span>
+            <span class="text-xs text-amber-400 font-mono font-bold block" id="peakTimeBadge">Morning best: --</span>
+            <span class="text-[10px] text-slate-400 block" id="peakSubText">Experimental model window</span>
           </div>
         </div>
 
@@ -584,9 +2270,9 @@ dist/
               <i class="fa-solid fa-mountain" id="verdictIcon"></i>
             </div>
             <div>
-              <h3 id="verdictTitle" class="font-bold text-sm text-slate-100">Analyzing Atmospheric Sounding</h3>
+              <h3 id="verdictTitle" class="font-bold text-sm text-slate-100">Awaiting trained local models</h3>
               <p id="verdictDesc" class="text-xs text-slate-400 mt-1 leading-relaxed">
-                Evaluating surface moisture, temperature cap aloft, and landmark visibility...
+                Run local model training and refresh to display live forecasts.
               </p>
             </div>
           </div>
@@ -669,8 +2355,8 @@ dist/
             <path id="upperCloudPath" d="M 0,25 Q 150,10 300,28 T 600,15 T 800,30 L 800,0 L 0,0 Z" fill="#475569" opacity="0.0" />
 
             <!-- Dynamic Cloud / Fog Layer Deck -->
-            <rect id="fogRect" x="0" y="200" width="800" height="180" fill="url(#fogGrad)" filter="url(#blurFog)" class="fog-layer" opacity="0.9" />
-            <path id="fogTopPuffs" d="M 0,200 Q 50,185 100,200 T 200,200 T 300,200 T 400,200 T 500,200 T 600,200 T 700,200 T 800,200 L 800,380 L 0,380 Z" fill="#f8fafc" opacity="0.6" class="fog-layer" />
+            <rect id="fogRect" x="0" y="200" width="800" height="180" fill="url(#fogGrad)" filter="url(#blurFog)" class="fog-layer" opacity="0" />
+            <path id="fogTopPuffs" d="M 0,200 Q 50,185 100,200 T 200,200 T 300,200 T 400,200 T 500,200 T 600,200 T 700,200 T 800,200 L 800,380 L 0,380 Z" fill="#f8fafc" opacity="0" class="fog-layer" />
 
             <!-- Mountain Terrain SVG Path (Boulder 5400' -> 1st Flatiron 7200' -> Green Mt 8100') -->
             <path d="M 0,270 
@@ -689,7 +2375,7 @@ dist/
                   stroke-width="2" />
 
             <!-- Dynamic Temperature Inversion Line (Thermal Sounding Cap) -->
-            <path id="tempInversionLine" d="M 40,270 Q 150,210 300,180 T 600,100" fill="none" stroke="#f43f5e" stroke-width="2.5" stroke-dasharray="4 4" opacity="0.8" />
+            <path id="tempInversionLine" d="M 40,270 Q 150,210 300,180 T 600,100" fill="none" stroke="#f43f5e" stroke-width="2.5" stroke-dasharray="4 4" opacity="0" />
 
             <!-- LANDMARK 1: CITY OF BOULDER (5,400 FT) -->
             <g id="lmBoulder">
@@ -701,7 +2387,7 @@ dist/
               <!-- Dynamic Status Tag -->
               <g id="badgeBoulder" transform="translate(120, 252)">
                 <rect x="-38" y="-12" width="76" height="16" rx="8" fill="#1e293b" stroke="#64748b" stroke-width="1" />
-                <text id="txtBadgeBoulder" x="0" y="0" fill="#e2e8f0" font-size="9" font-weight="bold" text-anchor="middle">☁️ IN FOG</text>
+                <text id="txtBadgeBoulder" x="0" y="0" fill="#e2e8f0" font-size="9" font-weight="bold" text-anchor="middle">UNVERIFIED</text>
               </g>
             </g>
 
@@ -714,7 +2400,7 @@ dist/
               <!-- Dynamic Status Tag -->
               <g id="badgeFlatiron" transform="translate(420, 130)">
                 <rect x="-42" y="-12" width="84" height="16" rx="8" fill="#064e3b" stroke="#10b981" stroke-width="1" />
-                <text id="txtBadgeFlatiron" x="0" y="0" fill="#34d399" font-size="9" font-weight="bold" text-anchor="middle">☀️ ABOVE FOG</text>
+                <text id="txtBadgeFlatiron" x="0" y="0" fill="#34d399" font-size="9" font-weight="bold" text-anchor="middle">UNVERIFIED</text>
               </g>
             </g>
 
@@ -727,21 +2413,21 @@ dist/
               <!-- Dynamic Status Tag -->
               <g id="badgeGreenMt" transform="translate(650, 70)">
                 <rect x="-44" y="-12" width="88" height="16" rx="8" fill="#064e3b" stroke="#10b981" stroke-width="1" />
-                <text id="txtBadgeGreenMt" x="0" y="0" fill="#34d399" font-size="9" font-weight="bold" text-anchor="middle">☀️ ABOVE FOG</text>
+                <text id="txtBadgeGreenMt" x="0" y="0" fill="#34d399" font-size="9" font-weight="bold" text-anchor="middle">UNVERIFIED</text>
               </g>
             </g>
 
             <!-- Dynamic Breakout Height Indicator Line -->
-            <g id="breakoutLineGroup">
+            <g id="breakoutLineGroup" style="display:none">
               <line id="breakoutLine" x1="0" y1="200" x2="800" y2="200" stroke="#06b6d4" stroke-width="1.5" stroke-dasharray="4 4" />
               <rect id="breakoutLabelBg" x="250" y="185" width="300" height="20" rx="4" fill="#0f172a" stroke="#06b6d4" stroke-width="1" />
-              <text id="breakoutText" x="400" y="199" fill="#38bdf8" font-size="10" font-weight="bold" font-family="JetBrains Mono" text-anchor="middle">Estimated Cloud Top: ~6,700 ft</text>
+              <text id="breakoutText" x="400" y="199" fill="#38bdf8" font-size="10" font-weight="bold" font-family="JetBrains Mono" text-anchor="middle">No verified cloud-top elevation</text>
             </g>
 
             <!-- Clear Atmosphere Overlay Notice (Triggers when probability is low <20%) -->
-            <g id="clearSkyNotice" style="display: none;">
+            <g id="clearSkyNotice" style="display: block;">
               <rect x="230" y="25" width="340" height="32" rx="8" fill="#0f172a" stroke="#f59e0b" stroke-width="1" opacity="0.95" />
-              <text x="400" y="46" fill="#fbbf24" font-size="11" font-weight="bold" text-anchor="middle">☀️ CLEAR MOUNTAIN AIR — NO INVERSION DECK</text>
+              <text x="400" y="46" fill="#fbbf24" font-size="11" font-weight="bold" text-anchor="middle">CLOUD TOP NOT VERIFIED</text>
             </g>
 
           </svg>
@@ -752,29 +2438,29 @@ dist/
         <div class="flex items-center justify-between text-xs text-slate-400 px-1 pt-1">
           <span class="flex items-center space-x-1.5" id="diagramFooterText">
             <i class="fa-solid fa-circle-info text-cyan-400"></i>
-            <span>Click any hour on the chart below to update this 3D profile in real time.</span>
+            <span>This terrain graphic is schematic; live cloud top is not available.</span>
           </span>
-          <span class="font-mono text-[11px] text-slate-400">Model: HRRR / GFS Sounding</span>
+          <span class="font-mono text-[11px] text-slate-400">GFS issued run · Observed fog labels · Cloud top unknown</span>
         </div>
 
       </div>
 
     </div>
 
-    <!-- 7-DAY OUTLOOK STRIP & DAY SELECTOR -->
+    <!-- 72-HOUR OUTLOOK STRIP & DAY SELECTOR -->
     <section class="glass-card rounded-3xl p-6 space-y-4">
       <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
         <div>
           <span class="text-xs font-bold tracking-widest text-cyan-400 uppercase">Interactive Day Selector</span>
-          <h3 class="text-lg font-extrabold text-white">7-Day Inversion Outlook</h3>
+          <h3 class="text-lg font-extrabold text-white">Next 72 Hours — Airport Fog Outlook</h3>
         </div>
         <span class="text-xs text-slate-400">Click any day to inspect its full 24-hour hourly profile</span>
       </div>
 
       <!-- Scrollable 7-day Strip -->
       <div id="forecastStrip" class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3 pt-1">
-        <!-- JS dynamically renders 7 day cards here -->
-        <div class="text-center py-6 text-slate-500 col-span-full">Loading 7-day forecast data...</div>
+        <!-- JS dynamically renders 3-day cards here -->
+        <div class="text-center py-6 text-slate-500 col-span-full">Loading short-range forecast data...</div>
       </div>
     </section>
 
@@ -786,7 +2472,7 @@ dist/
         <div>
           <div class="flex items-center space-x-2">
             <span class="text-xs font-bold tracking-widest text-emerald-400 uppercase">24-Hour Diurnal Sounding</span>
-            <span id="chartDayLabel" class="text-xs font-mono text-slate-300 bg-slate-800 px-2 py-0.5 rounded border border-slate-700">Tomorrow</span>
+            <span id="chartDayLabel" class="text-xs font-mono text-slate-300 bg-slate-800 px-2 py-0.5 rounded border border-slate-700">Awaiting model</span>
           </div>
           <h3 class="text-lg font-extrabold text-white mt-0.5">Hourly Inversion Timeline</h3>
         </div>
@@ -795,11 +2481,11 @@ dist/
         <div class="flex items-center bg-slate-900 p-1 rounded-2xl border border-slate-800 self-start md:self-auto">
           <button onclick="setChartMode('probability')" id="btnModeProb" class="px-4 py-2 rounded-xl text-xs font-bold transition flex items-center space-x-2 bg-cyan-950 text-cyan-300 border border-cyan-800/80 shadow">
             <i class="fa-solid fa-chart-area"></i>
-            <span>Inversion Probability (%)</span>
+            <span>Model Score (%)</span>
           </button>
-          <button onclick="setChartMode('elevation')" id="btnModeElev" class="px-4 py-2 rounded-xl text-xs font-bold transition flex items-center space-x-2 text-slate-400 hover:text-white">
+          <button onclick="setChartMode('clouds')" id="btnModeElev" class="px-4 py-2 rounded-xl text-xs font-bold transition flex items-center space-x-2 text-slate-400 hover:text-white">
             <i class="fa-solid fa-layer-group"></i>
-            <span>Cloud Top Elevation (ft)</span>
+            <span>Low Cloud Cover (%)</span>
           </button>
         </div>
       </div>
@@ -818,15 +2504,15 @@ dist/
         <div class="flex items-center space-x-4">
           <span class="flex items-center space-x-1.5">
             <span class="w-3 h-3 rounded-full bg-cyan-400 inline-block"></span>
-            <span>Probability Score</span>
+            <span>Experimental Model Score</span>
           </span>
           <span class="flex items-center space-x-1.5">
             <span class="w-3 h-0.5 bg-amber-400 inline-block"></span>
-            <span>Cloud Top Elevation</span>
+            <span>Low Cloud Cover</span>
           </span>
         </div>
         <div class="text-slate-400 font-mono text-[11px]" id="chartSelectedHourInfo">
-          Hover or click bars to inspect individual hour conditions.
+          Click a bar to inspect the available hourly data.
         </div>
       </div>
 
@@ -852,7 +2538,7 @@ dist/
             <div id="barLowClouds" class="bg-cyan-400 h-full rounded-full transition-all duration-500" style="width: 0%"></div>
           </div>
         </div>
-        <p class="text-xs text-slate-400" id="descLowClouds">Traps moist cold air inside Boulder valley floor.</p>
+        <p class="text-xs text-slate-400" id="descLowClouds">GFS low cloud fraction near Boulder, not observed fog.</p>
       </div>
 
       <!-- Metric 2: Summit Sky Clearance -->
@@ -872,7 +2558,7 @@ dist/
             <div id="barClearSky" class="bg-amber-400 h-full rounded-full transition-all duration-500" style="width: 0%"></div>
           </div>
         </div>
-        <p class="text-xs text-slate-400" id="descClearSky">Allows sunlight on 1st Flatiron & Green Mt.</p>
+        <p class="text-xs text-slate-400" id="descClearSky">Mid and high cloud fractions do not guarantee summit clear skies.</p>
       </div>
 
       <!-- Metric 3: Thermal Sounding Cap Delta -->
@@ -890,10 +2576,10 @@ dist/
           </div>
           <div class="text-xs font-mono text-slate-300 mt-2 flex items-center justify-between">
             <span>Surface: <span id="valSurfTemp">--°C</span></span>
-            <span>8,100': <span id="valHighTemp">--°C</span></span>
+            <span>Pressure level: <span id="valHighTemp">--</span></span>
           </div>
         </div>
-        <p class="text-xs text-slate-400" id="descTempDelta">Warm cap prevents fog from rising higher.</p>
+        <p class="text-xs text-slate-400" id="descTempDelta">Simple local temperature gradient, not measured cloud-top height.</p>
       </div>
 
       <!-- Metric 4: Surface Wind Vector -->
@@ -916,9 +2602,19 @@ dist/
             <div id="barWind" class="bg-emerald-400 h-full rounded-full transition-all duration-500" style="width: 0%"></div>
           </div>
         </div>
-        <p class="text-xs text-slate-400" id="descWind">Upslope easterly wind feeds cloud deck.</p>
+        <p class="text-xs text-slate-400" id="descWind">Wind direction and speed from GFS.</p>
       </div>
 
+    </section>
+
+    <!-- ELEVATION-TARGET OUTPUTS: explicit NA when independent mountain labels absent -->
+    <section class="glass-card rounded-3xl p-6 space-y-3" id="elevationSection">
+      <h3 class="text-lg font-bold text-white">Elevation-specific cloud outlook</h3>
+      <p class="text-xs text-slate-400">Summit scenic-event probabilities require independent summit observations. Airport cloud BASE is not cloud TOP; these are not interchangeable.</p>
+      <div id="landmarkForecasts" class="grid grid-cols-1 md:grid-cols-3 gap-3" aria-live="polite">
+        <div class="text-slate-400 text-sm">Loading observation-trained elevation models…</div>
+      </div>
+      <p id="cloudBaseSummary" class="text-xs text-slate-400"></p>
     </section>
 
     <!-- HIKING & PHOTOGRAPHY ACTION PLAN -->
@@ -938,7 +2634,7 @@ dist/
           <i class="fa-regular fa-clock text-amber-400 text-lg"></i>
           <div>
             <div class="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Recommended Trail Start</div>
-            <div id="recAlarmTime" class="text-sm font-extrabold text-white font-mono">5:30 AM MDT</div>
+            <div id="recAlarmTime" class="text-sm font-extrabold text-white font-mono">Not calculated</div>
           </div>
         </div>
       </div>
@@ -950,9 +2646,9 @@ dist/
             <i class="fa-solid fa-map-location-dot"></i>
             <span>Optimal Destination</span>
           </div>
-          <h4 id="recTrailheadTitle" class="font-bold text-slate-100 text-base">Top of 1st Flatiron or Green Mt</h4>
+          <h4 id="recTrailheadTitle" class="font-bold text-slate-100 text-base">No destination forecast yet</h4>
           <p id="recTrailheadDesc" class="text-xs text-slate-300 leading-relaxed">
-            Target 7,200 ft elevation to break through the cloud top into full golden hour sunlight.
+            Check current webcams and local observations before planning a summit outing.
           </p>
         </div>
 
@@ -961,9 +2657,9 @@ dist/
             <i class="fa-solid fa-layer-group"></i>
             <span>Ceiling vs Landmarks</span>
           </div>
-          <h4 id="recBreakoutTitle" class="font-bold text-slate-100 text-base">Breakout at ~6,700 ft</h4>
+          <h4 id="recBreakoutTitle" class="font-bold text-slate-100 text-base">Cloud top unknown</h4>
           <p id="recBreakoutDesc" class="text-xs text-slate-300 leading-relaxed">
-            City of Boulder (5,400') submerged in fog; 1st Flatiron (7,200') and Green Mt (8,100') clear and above clouds.
+            Summit visibility is not estimated in this version.
           </p>
         </div>
 
@@ -972,9 +2668,9 @@ dist/
             <i class="fa-solid fa-camera"></i>
             <span>Gear & Photo Advice</span>
           </div>
-          <h4 id="recGearTitle" class="font-bold text-slate-100 text-base">High-Contrast Lighting Pack</h4>
+          <h4 id="recGearTitle" class="font-bold text-slate-100 text-base">Weather-dependent preparation</h4>
           <p id="recGearDesc" class="text-xs text-slate-300 leading-relaxed">
-            Headlamp required in damp lower meadow. Summit will be warm and sunny; pack ND filter for sunrise over cloud sea.
+            Check trail conditions and bring suitable layers and a headlamp if hiking before sunrise.
           </p>
         </div>
 
@@ -989,7 +2685,7 @@ dist/
       <div class="flex items-center space-x-2">
         <span>© Boulder Inversion Tracker & Predictor</span>
         <span>•</span>
-        <span>Open-Meteo High-Resolution Sounding Engine</span>
+        <span>Open-Meteo GFS forecast · Experimental ML</span>
       </div>
       <div class="flex items-center space-x-4">
         <span>Boulder City: 5,400 ft</span>
@@ -1000,907 +2696,200 @@ dist/
   </footer>
 
   <!-- APPLICATION JAVASCRIPT LOGIC -->
-  <script>
-    /**
-     * Atmospheric Model & Coordinates Configuration
-     * Open-Meteo API endpoint for Boulder, CO (40.0150, -105.2705)
-     */
-    const BOULDER_LAT = 40.0150;
-    const BOULDER_LON = -105.2705;
-
-    // Landmark Altitudes in ft MSL
-    const ELEV_BOULDER = 5400;
-    const ELEV_FLATIRON = 7200;
-    const ELEV_GREEN_MT = 8100;
-
-    // State object
-    let state = {
-      isLive: true,
-      rawHourly: null,
-      daysData: [],           // 7 days of 24h metrics
-      selectedDayIdx: 1,      // Default 1 = Tomorrow
-      selectedHourIdx: 6,     // Default to peak hour of selected day
-      chartMode: 'probability' // 'probability' or 'elevation'
-    };
-
-    /**
-     * Presets Data Structure for Instant Testing
-     */
-    const PRESETS = {
-      epic: generateSyntheticDay("Classic Inversion (7,200' & 8,100' Above Fog)", 6700, 92, 2.0, 7.5, 95, 80),
-      high: generateSyntheticDay("High Fog Deck (Only 8,100' Peak Above)", 7600, 84, 1.0, 4.0, 96, 60),
-      socked: generateSyntheticDay("Deep Fog Deck (All 3 Socked In)", 8400, 76, 0.5, -2.0, 98, 40),
-      clear: generateSyntheticDay("Bluebird / Downslope (No Inversion)", 5400, 12, 14.0, 3.0, 30, 270)
-    };
-
-    /**
-     * Window Load Initializer
-     */
-    window.onload = function() {
-      fetchWeatherData();
-    };
-
-    /**
-     * Fetch Live Forecast Data from Open-Meteo API
-     */
-    async function fetchWeatherData() {
-      const refreshIcon = document.getElementById('refreshIcon');
-      refreshIcon.classList.add('fa-spin');
-
-      const apiUrl = `https://api.open-meteo.com/v1/forecast?latitude=${BOULDER_LAT}&longitude=${BOULDER_LON}&hourly=temperature_2m,dew_point_2m,relative_humidity_2m,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,wind_speed_10m,wind_direction_10m,temperature_850hPa,temperature_750hPa&timezone=America%2FDenver`;
-
-      try {
-        const response = await fetch(apiUrl);
-        if (!response.ok) throw new Error("API Network Response Error");
-        const data = await response.json();
-
-        state.isLive = true;
-        state.rawHourly = data.hourly;
-        
-        // Parse raw hourly data into 7 daily arrays of 24 hours each
-        parseSevenDaysData(data.hourly);
-
-        setActivePresetBtn('live');
-        document.getElementById('apiStatusText').textContent = "Open-Meteo Synced";
-        document.getElementById('statusBadge').classList.remove('hidden');
-
-        // Render selected day UI
-        renderSelectedDay();
-
-      } catch (err) {
-        console.warn("Live API fetch failed, switching to high-precision synthetic simulation...", err);
-        document.getElementById('apiStatusText').textContent = "Simulation Mode";
-        loadPreset('epic');
-      } flexFinally: {
-        refreshIcon.classList.remove('fa-spin');
-      }
-    }
-
-    /**
-     * Parse 168 hours of Open-Meteo data into 7 structured days
-     */
-    function parseSevenDaysData(hourly) {
-      if (!hourly || !hourly.time) return;
-
-      const daysMap = {};
-      for (let i = 0; i < hourly.time.length; i++) {
-        const timeStr = hourly.time[i]; // "2026-10-28T06:00"
-        const [dateStr, hourStr] = timeStr.split('T');
-        const hour = parseInt(hourStr.split(':')[0]);
-
-        if (!daysMap[dateStr]) {
-          daysMap[dateStr] = [];
-        }
-
-        const metrics = calculateHourlyMetrics(hourly, i, hour);
-        daysMap[dateStr].push(metrics);
-      }
-
-      // Convert days map to array of days
-      const keys = Object.keys(daysMap).slice(0, 7);
-      state.daysData = keys.map((dateStr, idx) => {
-        const hours = daysMap[dateStr];
-        
-        // Find peak hour in this day (usually 5 AM - 9 AM)
-        let peakHour = 6;
-        let maxProb = -1;
-        hours.forEach(h => {
-          if (h.probability > maxProb) {
-            maxProb = h.probability;
-            peakHour = h.hour;
-          }
-        });
-
-        const dateObj = new Date(dateStr + 'T12:00:00');
-        return {
-          dateStr: dateStr,
-          dateObj: dateObj,
-          dayLabel: idx === 0 ? 'Today' : idx === 1 ? 'Tomorrow' : dateObj.toLocaleDateString('en-US', { weekday: 'short' }),
-          dateFormatted: dateObj.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric' }),
-          hours: hours,
-          peakHour: peakHour,
-          peakProb: maxProb
-        };
-      });
-    }
-
-    /**
-     * Compute Inversion Probability Score & Ceiling for a single hour
-     */
-    function calculateHourlyMetrics(hourly, i, hour) {
-      const lowClouds = Math.round(hourly.cloud_cover_low[i] || 0);
-      const midClouds = Math.round(hourly.cloud_cover_mid[i] || 0);
-      const highClouds = Math.round(hourly.cloud_cover_high[i] || 0);
-      const surfTemp = parseFloat((hourly.temperature_2m[i] || 0).toFixed(1));
-      const dewPoint = parseFloat((hourly.dew_point_2m[i] || 0).toFixed(1));
-      const rh = Math.round(hourly.relative_humidity_2m[i] || 0);
-      const temp750 = parseFloat((hourly.temperature_750hPa[i] || 0).toFixed(1));
-      const windSpeed = Math.round(hourly.wind_speed_10m[i] || 0);
-      const windDir = Math.round(hourly.wind_direction_10m[i] || 0);
-
-      // Core Atmospheric Algorithm Scoring
-      let score = 0;
-
-      // 1. Low Cloud Deck Component (Max 35 pts)
-      score += (lowClouds / 100) * 35;
-
-      // 2. Clear Upper Sky Component (Max 25 pts)
-      const avgUpperCloud = (midClouds + highClouds) / 2;
-      score += Math.max(0, 25 - (avgUpperCloud * 0.25));
-
-      // 3. Temperature Inversion Cap Delta (Max 25 pts)
-      const tempDelta = temp750 - surfTemp; // positive means warm air aloft
-      if (tempDelta > 0) {
-        score += Math.min(25, 12 + (tempDelta * 2.5));
-      } else if (tempDelta > -2.0) {
-        score += 6;
-      }
-
-      // 4. Moisture Saturation (Max 10 pts)
-      const spread = surfTemp - dewPoint;
-      if (spread <= 1.5 || rh >= 90) score += 10;
-      else if (spread <= 3.0 || rh >= 80) score += 6;
-
-      // 5. Wind Direction & Speed Dynamics (Max 5 pts / Penalty)
-      const isEasterly = (windDir >= 40 && windDir <= 140);
-      const isWesterlyDownslope = (windDir >= 220 && windDir <= 320);
-
-      if (isEasterly && windSpeed <= 12) score += 5;
-      else if (isWesterlyDownslope && windSpeed > 14) score -= 20; // Downslope chinook scour
-
-      const probability = Math.min(100, Math.max(0, Math.round(score)));
-
-      // Estimate Cloud Ceiling Altitude MSL (ft) based on sounding & humidity
-      let ceiling = ELEV_BOULDER;
-      if (probability > 18) {
-        if (tempDelta > 2.5) {
-          ceiling = 6700; // Classic low deck (below 1st Flatiron)
-        } else if (tempDelta > 0) {
-          ceiling = 7500; // Mid deck (between Flatiron & Green Mt)
-        } else {
-          ceiling = 8300; // High socked-in deck
-        }
-      }
-
-      return {
-        hour: hour,
-        timeStr: `${hour.toString().padStart(2, '0')}:00`,
-        lowClouds, midClouds, highClouds,
-        surfTemp, dewPoint, rh, temp750,
-        tempDelta, windSpeed, windDir,
-        probability,
-        ceiling
-      };
-    }
-
-    /**
-     * Render UI for selected day & peak/clicked hour
-     */
-    function renderSelectedDay() {
-      if (!state.daysData || state.daysData.length === 0) return;
-
-      const dayObj = state.daysData[state.selectedDayIdx] || state.daysData[0];
-      
-      // Update Day Label Tags
-      document.getElementById('selectedDateLabel').textContent = `${dayObj.dayLabel} (${dayObj.dateFormatted})`;
-      document.getElementById('chartDayLabel').textContent = `${dayObj.dayLabel} (${dayObj.dateFormatted})`;
-
-      // Find peak hour if not explicitly selected
-      const currentHourData = dayObj.hours.find(h => h.hour === state.selectedHourIdx) || dayObj.hours[dayObj.peakHour] || dayObj.hours[6];
-      state.selectedHourIdx = currentHourData.hour;
-
-      // Update Peak Time Badge
-      const formatTime = (h) => {
-        const ampm = h >= 12 ? 'PM' : 'AM';
-        const h12 = h % 12 === 0 ? 12 : h % 12;
-        return `${h12}:00 ${ampm}`;
-      };
-      
-      document.getElementById('peakTimeBadge').textContent = `Peak: ${formatTime(dayObj.peakHour)}`;
-      document.getElementById('currentHourBadge').textContent = `${formatTime(currentHourData.hour)} MDT`;
-
-      // Render Gauge & Main Verdict Box
-      renderGaugeAndVerdict(currentHourData);
-
-      // Render SVG Elevation Cross Section Diagram
-      renderSVGDiagram(currentHourData);
-
-      // Render 7-Day Outlook Strip
-      render7DayStrip();
-
-      // Render 24-Hour Timeline SVG Chart
-      renderHourlyChart(dayObj);
-
-      // Render Metric Breakdown Cards
-      renderMetricCards(currentHourData);
-
-      // Render Hiking Recommendations Strategy
-      renderHikingPlan(currentHourData);
-    }
-
-    /**
-     * Render Probability Gauge Arc & Verdict Box
-     */
-    function renderGaugeAndVerdict(h) {
-      const probPercent = document.getElementById('probPercent');
-      const gaugeArc = document.getElementById('gaugeArc');
-      const score = h.probability;
-
-      probPercent.textContent = `${score}%`;
-
-      // SVG Circle Gauge Arc calculation (r=50, circumference = 314.15)
-      const circumference = 314.15;
-      const strokeOffset = circumference - (score / 100) * circumference;
-      gaugeArc.style.strokeDashoffset = strokeOffset;
-
-      const badge = document.getElementById('probCategory');
-      const verdictTitle = document.getElementById('verdictTitle');
-      const verdictDesc = document.getElementById('verdictDesc');
-      const verdictIcon = document.getElementById('verdictIcon');
-      const verdictContainer = document.getElementById('verdictIconContainer');
-
-      if (score >= 80) {
-        gaugeArc.setAttribute('class', 'gauge-circle stroke-emerald-400');
-        badge.textContent = "CLASSIC INVERSION GUARANTEED!";
-        badge.className = "text-xs font-bold uppercase tracking-wider text-emerald-400 mt-1 px-3 py-1 bg-emerald-950/90 rounded-full border border-emerald-700/60";
-
-        verdictTitle.textContent = "Sea of Clouds Over Boulder Valley!";
-        verdictDesc.textContent = `Boulder (5,400') is submerged in thick fog while 1st Flatiron (7,200') and Green Mt (8,100') sit in warm, brilliant sunshine above the deck!`;
-        verdictIcon.className = "fa-solid fa-cloud-sun text-emerald-400";
-        verdictContainer.className = "p-2.5 rounded-xl bg-emerald-950 text-emerald-400 text-lg flex-shrink-0";
-      } else if (score >= 50) {
-        gaugeArc.setAttribute('class', 'gauge-circle stroke-cyan-400');
-        badge.textContent = "HIGH PROBABILITY";
-        badge.className = "text-xs font-bold uppercase tracking-wider text-cyan-400 mt-1 px-3 py-1 bg-cyan-950/90 rounded-full border border-cyan-700/60";
-
-        verdictTitle.textContent = "Favorable Cloud Ceiling Setup";
-        verdictDesc.textContent = `Cloud breakout layer estimated around ~${h.ceiling.toLocaleString()} ft. Summit of Green Mt (8,100') will be clear of fog.`;
-        verdictIcon.className = "fa-solid fa-mountain text-cyan-400";
-        verdictContainer.className = "p-2.5 rounded-xl bg-cyan-950 text-cyan-400 text-lg flex-shrink-0";
-      } else if (score >= 25) {
-        gaugeArc.setAttribute('class', 'gauge-circle stroke-amber-400');
-        badge.textContent = "MODERATE / MARGINAL";
-        badge.className = "text-xs font-bold uppercase tracking-wider text-amber-400 mt-1 px-3 py-1 bg-amber-950/90 rounded-full border border-amber-700/60";
-
-        verdictTitle.textContent = "Marginal Cloud Ceiling";
-        verdictDesc.textContent = "Cloud deck may be patchy or elevated. Higher peaks may drift in and out of fog.";
-        verdictIcon.className = "fa-solid fa-smog text-amber-400";
-        verdictContainer.className = "p-2.5 rounded-xl bg-amber-950 text-amber-400 text-lg flex-shrink-0";
-      } else {
-        gaugeArc.setAttribute('class', 'gauge-circle stroke-rose-400');
-        badge.textContent = "UNLIKELY / NO INVERSION";
-        badge.className = "text-xs font-bold uppercase tracking-wider text-rose-400 mt-1 px-3 py-1 bg-rose-950/90 rounded-full border border-rose-700/60";
-
-        const reason = h.windSpeed > 14 ? "Strong downslope Chinook winds blowing out valley moisture." : "Dry atmosphere column with crisp, clear views at all elevations.";
-        verdictTitle.textContent = "Clear Atmosphere (No Cloud Layer)";
-        verdictDesc.textContent = reason;
-        verdictIcon.className = "fa-solid fa-sun text-rose-400";
-        verdictContainer.className = "p-2.5 rounded-xl bg-rose-950 text-rose-400 text-lg flex-shrink-0";
-      }
-    }
-
-    /**
-     * Update Interactive SVG Mountain Cross-Section Diagram
-     */
-    function renderSVGDiagram(h) {
-      const fogRect = document.getElementById('fogRect');
-      const fogPuffs = document.getElementById('fogTopPuffs');
-      const upperCloudPath = document.getElementById('upperCloudPath');
-      const breakoutLineGroup = document.getElementById('breakoutLineGroup');
-      const breakoutText = document.getElementById('breakoutText');
-      const breakoutLine = document.getElementById('breakoutLine');
-      const clearNotice = document.getElementById('clearSkyNotice');
-
-      // SVG Altitude Mapping:
-      // 8,100 ft (Green Mt) -> Y = 95
-      // 7,200 ft (1st Flatiron) -> Y = 150
-      // 5,400 ft (Boulder City) -> Y = 270
-      // Base -> Y = 380
-
-      const score = h.probability;
-      const ceiling = h.ceiling;
-
-      // Calculate Fog SVG Y Position
-      // Linear mapping from MSL altitude to SVG Y pixel:
-      // Y = 270 - ((alt - 5400) / (8100 - 5400)) * (270 - 95)
-      let fogY = 270 - ((ceiling - 5400) / 2700) * 175;
-      let opacity = (h.lowClouds / 100) * 0.9;
-
-      if (score < 20) {
-        // Low probability -> Clear air mode
-        opacity = 0.0;
-        fogY = 350;
-        clearNotice.style.display = 'block';
-        breakoutLineGroup.style.display = 'none';
-      } else {
-        clearNotice.style.display = 'none';
-        breakoutLineGroup.style.display = 'block';
-      }
-
-      // Update Fog Rect & Puffs
-      fogRect.setAttribute('y', fogY);
-      fogRect.setAttribute('height', 380 - fogY);
-      fogRect.setAttribute('opacity', opacity);
-
-      fogPuffs.setAttribute('d', `M 0,${fogY} Q 50,${fogY-15} 100,${fogY} T 200,${fogY} T 300,${fogY} T 400,${fogY} T 500,${fogY} T 600,${fogY} T 700,${fogY} T 800,${fogY} L 800,380 L 0,380 Z`);
-      fogPuffs.setAttribute('opacity', opacity > 0 ? 0.65 : 0);
-
-      // Upper Mid/High Cloud Layer
-      const avgUpper = (h.midClouds + h.highClouds) / 2;
-      upperCloudPath.setAttribute('opacity', (avgUpper / 100) * 0.85);
-
-      // Breakout Line & Text
-      if (score >= 20) {
-        breakoutLine.setAttribute('y1', fogY);
-        breakoutLine.setAttribute('y2', fogY);
-        document.getElementById('breakoutLabelBg').setAttribute('y', fogY - 12);
-        breakoutText.setAttribute('y', fogY + 2);
-        breakoutText.textContent = `Estimated Cloud Top: ~${ceiling.toLocaleString()} ft MSL`;
-      }
-
-      // Dynamic Landmark Status Badges (In Fog vs Above Fog vs Clear Sky)
-      updateLandmarkBadge('txtBadgeBoulder', 'badgeBoulder', ELEV_BOULDER, ceiling, score);
-      updateLandmarkBadge('txtBadgeFlatiron', 'badgeFlatiron', ELEV_FLATIRON, ceiling, score);
-      updateLandmarkBadge('txtBadgeGreenMt', 'badgeGreenMt', ELEV_GREEN_MT, ceiling, score);
-    }
-
-    /**
-     * Helper to style landmark badges on SVG (In Fog / Above Clouds)
-     */
-    function updateLandmarkBadge(txtId, groupId, landmarkAlt, cloudCeiling, score) {
-      const txtNode = document.getElementById(txtId);
-      const groupNode = document.getElementById(groupId);
-      if (!txtNode || !groupNode) return;
-
-      const rectNode = groupNode.querySelector('rect');
-
-      if (score < 20) {
-        txtNode.textContent = "☀️ CLEAR SKY";
-        txtNode.setAttribute('fill', '#fde047');
-        rectNode.setAttribute('fill', '#451a03');
-        rectNode.setAttribute('stroke', '#f59e0b');
-      } else if (cloudCeiling >= landmarkAlt) {
-        txtNode.textContent = "☁️ IN FOG";
-        txtNode.setAttribute('fill', '#e2e8f0');
-        rectNode.setAttribute('fill', '#1e293b');
-        rectNode.setAttribute('stroke', '#64748b');
-      } else {
-        txtNode.textContent = "☀️ ABOVE CLOUDS";
-        txtNode.setAttribute('fill', '#34d399');
-        rectNode.setAttribute('fill', '#064e3b');
-        rectNode.setAttribute('stroke', '#10b981');
-      }
-    }
-
-    /**
-     * Render 7-Day Outlook Strip
-     */
-    function render7DayStrip() {
-      const strip = document.getElementById('forecastStrip');
-      strip.innerHTML = '';
-
-      state.daysData.forEach((day, idx) => {
-        const isSelected = idx === state.selectedDayIdx;
-        const score = day.peakProb;
-
-        let scoreClass = "bg-rose-950/60 text-rose-400 border-rose-800/40";
-        let iconClass = "fa-sun text-amber-400";
-        if (score >= 75) {
-          scoreClass = "bg-emerald-950/80 text-emerald-300 border-emerald-700/60";
-          iconClass = "fa-cloud-sun text-emerald-400";
-        } else if (score >= 45) {
-          scoreClass = "bg-cyan-950/80 text-cyan-300 border-cyan-700/60";
-          iconClass = "fa-smog text-cyan-400";
-        }
-
-        const borderClass = isSelected ? "border-cyan-400 bg-cyan-950/40 ring-1 ring-cyan-400/50 shadow-lg" : "border-slate-800 bg-slate-900/80 hover:border-slate-700";
-
-        const cardHtml = `
-          <div onclick="selectDay(${idx})" class="cursor-pointer border rounded-2xl p-3 flex flex-col justify-between items-center text-center transition ${borderClass}">
-            <div>
-              <div class="text-xs font-bold ${isSelected ? 'text-cyan-300' : 'text-slate-200'}">${day.dayLabel}</div>
-              <div class="text-[10px] text-slate-400 font-mono">${day.dateFormatted}</div>
-            </div>
-
-            <div class="my-2.5 flex flex-col items-center">
-              <i class="fa-solid ${iconClass} text-lg my-1"></i>
-              <span class="text-xl font-black font-mono text-white">${score}%</span>
-            </div>
-
-            <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border ${scoreClass} w-full truncate">
-              ${score >= 75 ? 'Epic' : score >= 45 ? 'Moderate' : 'Unlikely'}
-            </span>
-          </div>
-        `;
-
-        strip.innerHTML += cardHtml;
-      });
-    }
-
-    /**
-     * Render 24-Hour Timeline SVG Chart (Probability OR Elevation Mode)
-     */
-    function renderHourlyChart(dayObj) {
-      const svg = document.getElementById('hourlyChartSVG');
-      svg.innerHTML = '';
-
-      const hours = dayObj.hours;
-      const isProbMode = state.chartMode === 'probability';
-
-      const width = 900;
-      const height = 240;
-      const paddingLeft = 50;
-      const paddingRight = 20;
-      const paddingTop = 25;
-      const paddingBottom = 40;
-
-      const chartWidth = width - paddingLeft - paddingRight;
-      const chartHeight = height - paddingTop - paddingBottom;
-      const barWidth = chartWidth / 24;
-
-      // 1. Draw Axis Grid Lines & Y-Axis Labels
-      let gridHtml = '';
-
-      if (isProbMode) {
-        // Probability Mode (0% to 100%)
-        [0, 25, 50, 75, 100].forEach(val => {
-          const y = paddingTop + chartHeight - (val / 100) * chartHeight;
-          gridHtml += `
-            <line x1="${paddingLeft}" y1="${y}" x2="${width - paddingRight}" y2="${y}" stroke="#1e293b" stroke-dasharray="3 3" />
-            <text x="${paddingLeft - 8}" y="${y + 4}" fill="#64748b" font-size="10" font-family="JetBrains Mono" text-anchor="end">${val}%</text>
-          `;
-        });
-      } else {
-        // Elevation Mode (5,000 ft to 9,000 ft MSL)
-        const elevs = [
-          { alt: 8100, label: "8,100' (Green Mt)", color: '#f59e0b' },
-          { alt: 7200, label: "7,200' (1st Flatiron)", color: '#38bdf8' },
-          { alt: 5400, label: "5,400' (Boulder City)", color: '#06b6d4' }
-        ];
-
-        elevs.forEach(e => {
-          const y = paddingTop + chartHeight - ((e.alt - 5000) / 4000) * chartHeight;
-          gridHtml += `
-            <line x1="${paddingLeft}" y1="${y}" x2="${width - paddingRight}" y2="${y}" stroke="${e.color}" stroke-dasharray="4 4" opacity="0.6" />
-            <text x="${paddingLeft - 8}" y="${y + 3}" fill="${e.color}" font-size="9" font-family="JetBrains Mono" font-weight="bold" text-anchor="end">${e.alt}'</text>
-          `;
-        });
-      }
-
-      svg.innerHTML += gridHtml;
-
-      // 2. Render 24 Hourly Bars / Points
-      let barsHtml = '';
-      let pointsArray = [];
-
-      hours.forEach((h, idx) => {
-        const x = paddingLeft + idx * barWidth;
-        const isSelected = h.hour === state.selectedHourIdx;
-
-        // X-Axis Hour Labels (every 3 hours)
-        if (idx % 3 === 0) {
-          const timeLabel = h.hour === 0 ? '12AM' : h.hour === 12 ? '12PM' : h.hour > 12 ? `${h.hour-12}PM` : `${h.hour}AM`;
-          barsHtml += `<text x="${x + barWidth/2}" y="${height - 12}" fill="#64748b" font-size="10" font-family="JetBrains Mono" text-anchor="middle">${timeLabel}</text>`;
-        }
-
-        if (isProbMode) {
-          // PROBABILITY MODE: Bar Chart
-          const val = h.probability;
-          const barH = (val / 100) * chartHeight;
-          const y = paddingTop + chartHeight - barH;
-
-          let color = val >= 75 ? '#10b981' : val >= 45 ? '#06b6d4' : '#64748b';
-          if (isSelected) color = '#fbbf24';
-
-          barsHtml += `
-            <rect class="chart-bar-hover" onclick="selectHour(${h.hour})" x="${x + 2}" y="${y}" width="${barWidth - 4}" height="${barH}" rx="3" fill="${color}" opacity="${isSelected ? '1' : '0.8'}">
-              <title>${h.timeStr}: ${val}% Inversion Probability</title>
-            </rect>
-          `;
-        } else {
-          // ELEVATION MODE: Interactive Line & Elevation Bars
-          const alt = h.probability < 20 ? 5400 : h.ceiling;
-          const y = paddingTop + chartHeight - ((alt - 5000) / 4000) * chartHeight;
-          
-          pointsArray.push({ x: x + barWidth/2, y: y, hour: h.hour, alt: alt, prob: h.probability });
-
-          const isClear = h.probability < 20;
-          barsHtml += `
-            <rect class="chart-bar-hover" onclick="selectHour(${h.hour})" x="${x + 2}" y="${y}" width="${barWidth - 4}" height="${paddingTop + chartHeight - y}" rx="3" fill="${isClear ? '#334155' : '#06b6d4'}" opacity="${isSelected ? '0.9' : '0.4'}">
-              <title>${h.timeStr}: Ceiling ~${alt} ft MSL</title>
-            </rect>
-          `;
-        }
-      });
-
-      // Render connected line for Elevation Mode
-      if (!isProbMode && pointsArray.length > 0) {
-        let pathD = `M ${pointsArray[0].x},${pointsArray[0].y}`;
-        pointsArray.forEach(p => {
-          pathD += ` L ${p.x},${p.y}`;
-        });
-
-        barsHtml += `<path d="${pathD}" fill="none" stroke="#f59e0b" stroke-width="2.5" stroke-linecap="round" />`;
-
-        pointsArray.forEach(p => {
-          const isSelected = p.hour === state.selectedHourIdx;
-          barsHtml += `
-            <circle onclick="selectHour(${p.hour})" class="cursor-pointer" cx="${p.x}" cy="${p.y}" r="${isSelected ? 6 : 4}" fill="${isSelected ? '#fbbf24' : '#f59e0b'}" stroke="#0f172a" stroke-width="1.5" />
-          `;
-        });
-      }
-
-      svg.innerHTML += barsHtml;
-    }
-
-    /**
-     * Set Chart View Mode (Probability vs Elevation)
-     */
-    function setChartMode(mode) {
-      state.chartMode = mode;
-      const btnProb = document.getElementById('btnModeProb');
-      const btnElev = document.getElementById('btnModeElev');
-
-      if (mode === 'probability') {
-        btnProb.className = "px-4 py-2 rounded-xl text-xs font-bold transition flex items-center space-x-2 bg-cyan-950 text-cyan-300 border border-cyan-800/80 shadow";
-        btnElev.className = "px-4 py-2 rounded-xl text-xs font-bold transition flex items-center space-x-2 text-slate-400 hover:text-white";
-      } else {
-        btnElev.className = "px-4 py-2 rounded-xl text-xs font-bold transition flex items-center space-x-2 bg-amber-950 text-amber-300 border border-amber-800/80 shadow";
-        btnProb.className = "px-4 py-2 rounded-xl text-xs font-bold transition flex items-center space-x-2 text-slate-400 hover:text-white";
-      }
-
-      renderSelectedDay();
-    }
-
-    /**
-     * User clicks a day in the 7-day strip
-     */
-    function selectDay(dayIdx) {
-      state.selectedDayIdx = dayIdx;
-      const dayObj = state.daysData[dayIdx];
-      state.selectedHourIdx = dayObj ? dayObj.peakHour : 6;
-      renderSelectedDay();
-    }
-
-    /**
-     * User clicks an hour on the 24-hour chart
-     */
-    function selectHour(hour) {
-      state.selectedHourIdx = hour;
-      renderSelectedDay();
-    }
-
-    /**
-     * Render Metric Breakdown Cards
-     */
-    function renderMetricCards(h) {
-      document.getElementById('metricLowClouds').textContent = `${h.lowClouds}%`;
-      document.getElementById('barLowClouds').style.width = `${h.lowClouds}%`;
-
-      const upperClear = Math.max(0, Math.round(100 - (h.midClouds + h.highClouds)/2));
-      document.getElementById('metricClearSky').textContent = `${upperClear}%`;
-      document.getElementById('barClearSky').style.width = `${upperClear}%`;
-
-      const delta = h.tempDelta.toFixed(1);
-      document.getElementById('metricTempDelta').textContent = `${delta > 0 ? '+' : ''}${delta}°C`;
-      document.getElementById('valSurfTemp').textContent = `${h.surfTemp}°C`;
-      document.getElementById('valHighTemp').textContent = `${h.temp750}°C`;
-
-      document.getElementById('metricWindSpeed').textContent = `${h.windSpeed} mph`;
-      document.getElementById('metricWindDir').textContent = getWindDirAbbr(h.windDir);
-      document.getElementById('windArrow').style.transform = `rotate(${h.windDir}deg)`;
-
-      const windQuality = (h.windDir >= 40 && h.windDir <= 140) ? Math.min(100, (15 - h.windSpeed) * 8) : 25;
-      document.getElementById('barWind').style.width = `${Math.max(10, windQuality)}%`;
-    }
-
-    /**
-     * Render Hiking & Landmark Recommendations Strategy
-     */
-    function renderHikingPlan(h) {
-      const alarm = document.getElementById('recAlarmTime');
-      const thTitle = document.getElementById('recTrailheadTitle');
-      const thDesc = document.getElementById('recTrailheadDesc');
-      const boTitle = document.getElementById('recBreakoutTitle');
-      const boDesc = document.getElementById('recBreakoutDesc');
-      const gearTitle = document.getElementById('recGearTitle');
-      const gearDesc = document.getElementById('recGearDesc');
-
-      const score = h.probability;
-      const ceiling = h.ceiling;
-
-      if (score >= 70) {
-        alarm.textContent = "5:15 AM MDT";
-        thTitle.textContent = "1st Flatiron Ridge or Green Mt";
-        thDesc.textContent = "Start at Chautauqua Ranger Cottage and hike up Gregory Canyon to break out above the 6,700' fog deck early.";
-
-        boTitle.textContent = `Cloud Ceiling: ~${ceiling.toLocaleString()} ft MSL`;
-        boDesc.textContent = "Boulder (5,400') submerged in dense fog; 1st Flatiron (7,200') and Green Mt (8,100') are in full warm sunshine!";
-
-        gearTitle.textContent = "High-Contrast Photography Pack";
-        gearDesc.textContent = "Headlamp required for lower fog trail. Pack sunglasses and ND filter for golden hour over the sea of clouds.";
-      } else if (score >= 40) {
-        alarm.textContent = "5:45 AM MDT";
-        thTitle.textContent = "Green Mountain Summit Target";
-        thDesc.textContent = "Higher cloud ceiling today (~7,500'). Target Green Mountain Summit (8,100') for guaranteed clear mountain views.";
-
-        boTitle.textContent = `Cloud Ceiling: ~${ceiling.toLocaleString()} ft MSL`;
-        boDesc.textContent = "Boulder and 1st Flatiron enveloped in fog; Green Mt summit breaks out above the cloud line.";
-
-        gearTitle.textContent = "Damp Trail & Moisture Layering";
-        gearDesc.textContent = "Pack waterproof shell for damp lower trail and headlamp for early morning start.";
-      } else {
-        alarm.textContent = "7:30 AM / Regular Hike";
-        thTitle.textContent = "Standard Day Hike (Clear Air)";
-        thDesc.textContent = "Inversion deck unlikely today. Crisp mountain views expected at all elevations.";
-
-        boTitle.textContent = "No Cloud Inversion Ceiling";
-        boDesc.textContent = "Valley floor, 1st Flatiron, and Green Mt all share clear atmospheric visibility.";
-
-        gearTitle.textContent = "Standard Daypack Essentials";
-        gearDesc.textContent = "Standard daylight hiking gear. Check wind advisory if strong westerly downslope winds are present.";
-      }
-    }
-
-    /**
-     * Generate Synthetic 24-hour day for testing Presets
-     */
-    function generateSyntheticDay(name, targetCeiling, targetProb, surfT, t750, lowC, wDir) {
-      const hours = [];
-      for (let h = 0; h < 24; h++) {
-        const isMorning = (h >= 5 && h <= 9);
-        const prob = isMorning ? targetProb : Math.max(10, targetProb - Math.abs(h - 7) * 9);
-        const ceiling = targetProb < 20 ? 5400 : targetCeiling;
-
-        hours.push({
-          hour: h,
-          timeStr: `${h.toString().padStart(2, '0')}:00`,
-          lowClouds: isMorning ? lowC : 30,
-          midClouds: 10,
-          highClouds: 5,
-          surfTemp: surfT,
-          dewPoint: surfT - 1.0,
-          rh: 90,
-          temp750: t750,
-          tempDelta: t750 - surfT,
-          windSpeed: 5,
-          windDir: wDir,
-          probability: prob,
-          ceiling: ceiling
-        });
-      }
-
-      const dateObj = new Date();
-      return [{
-        dateStr: dateObj.toISOString().split('T')[0],
-        dateObj: dateObj,
-        dayLabel: 'Preset Scenario',
-        dateFormatted: name,
-        hours: hours,
-        peakHour: 7,
-        peakProb: targetProb
-      }];
-    }
-
-    /**
-     * Load Atmospheric Preset Scenario
-     */
-    function loadPreset(key) {
-      setActivePresetBtn(key);
-      if (key === 'live') {
-        if (state.rawHourly) {
-          parseSevenDaysData(state.rawHourly);
-          renderSelectedDay();
-        } else {
-          fetchWeatherData();
-        }
-        return;
-      }
-
-      const presetData = PRESETS[key];
-      if (presetData) {
-        state.isLive = false;
-        state.daysData = presetData;
-        state.selectedDayIdx = 0;
-        state.selectedHourIdx = 7;
-        renderSelectedDay();
-      }
-    }
-
-    function setActivePresetBtn(activeKey) {
-      document.querySelectorAll('.preset-btn').forEach(btn => {
-        btn.className = "preset-btn px-3 py-1.5 rounded-xl font-medium border border-slate-700 bg-slate-900 text-slate-300 hover:border-slate-500 transition";
-      });
-      const activeBtn = document.getElementById(`btn-${activeKey}`);
-      if (activeBtn) {
-        activeBtn.className = "preset-btn px-3 py-1.5 rounded-xl font-medium border border-cyan-500 bg-cyan-950/80 text-cyan-300 shadow-sm transition";
-      }
-    }
-
-    function getWindDirAbbr(deg) {
-      const dirs = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
-      return dirs[Math.floor((deg / 22.5) + 0.5) % 16];
-    }
-  </script>
+  <script src="dashboard.js" defer></script>
 </body>
 </html>
+</file>
+
+<file path="requirements.txt">
+# CPU-only training and locally hosted inference (no paid cloud service).
+numpy>=1.26,<3
+scikit-learn>=1.4,<2
+xgboost>=2.0,<4
+torch>=2.2,<3
+requests>=2.31,<3
+fastapi>=0.110,<1
+uvicorn>=0.29,<1
+# Tests: pip install -r requirements-dev.txt
 </file>
 
 <file path="science.html">
-<!DOCTYPE html>
-<html lang="en" class="dark">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>The Science | Boulder Inversion Tracker</title>
-  
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = {
-      darkMode: 'class',
-      theme: {
-        extend: {
-          colors: {
-            alpine: { 900: '#080c14', 800: '#0f172a', 700: '#1e293b', 600: '#334155', cyan: '#06b6d4' }
-          },
-          fontFamily: {
-            sans: ['Inter', 'sans-serif'],
-            mono: ['JetBrains Mono', 'monospace'],
-          }
-        }
-      }
-    }
-  </script>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-  <style>
-    body { font-family: 'Inter', sans-serif; background-color: #060911; color: #f8fafc; }
-    .glass-card { background: rgba(15, 23, 42, 0.78); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); }
-    ::-webkit-scrollbar { width: 6px; }
-    ::-webkit-scrollbar-track { background: #0b1120; }
-    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
-  </style>
-</head>
-<body class="min-h-screen text-slate-100 flex flex-col justify-between selection:bg-cyan-500 selection:text-slate-950">
+<!DOCTYPE html><html lang="en" class="dark"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Science | Boulder Inversion Tracker</title><script src="https://cdn.tailwindcss.com"></script><style>body{background:#060911;color:#e2e8f0;font-family:system-ui,sans-serif}a{color:#67e8f9}.card{background:#0f172a;border:1px solid #334155;border-radius:20px;padding:28px}</style></head><body class="min-h-screen"><header class="border-b border-slate-700 p-5"><nav class="max-w-4xl mx-auto flex justify-between gap-4"><strong>Boulder Inversion Tracker — Science</strong><div class="space-x-5"><a href="/">Dashboard</a><a href="/guide.html">Guide</a></div></nav></header><main class="max-w-4xl mx-auto p-6 space-y-6">
+<section class="card space-y-3"><h1 class="text-2xl font-extrabold">Three different physical events</h1><p><strong>Temperature inversion:</strong> locally warmer air above colder air; a vertically resolved thermal phenomenon. <strong>Airport fog:</strong> measured near-surface visibility and clouds at a weather station. <strong>Scenic cloud sea:</strong> low clouds in the Boulder area with clear viewing at a particular higher elevation. None is equivalent to the others.</p><p>The current airport-fog ML output is trained with independent METAR observations. It does not establish a measured inversion or above-cloud summit event.</p></section>
+<section class="card space-y-3"><h2 class="text-xl font-bold">Numerical weather forecasts become ML features</h2><p>Open-Meteo serves individual historical and live NOAA GFS runs. We ingest surface forecast humidity, visibility, weather codes, clouds and wind, plus atmospheric temperature, humidity, wind, cloud cover and geopotential height at pressure levels. XGBoost also receives local time and forecast lead (hours between run initialization and valid time). The CNN receives five interpolated vertical channels: temperature, humidity, east-west and north-south wind, and forecast cloud cover.</p><p>All training and inference weather features come from a particular initialized GFS forecast run. The strict lead-time bound is less than 72 hours. An issued forecast is not replaced with the hindsight-laden stitched historical forecast archive.</p></section>
+<section class="card space-y-3"><h2 class="text-xl font-bold">Independent observations and labels</h2><p>Airport KBDU/METAR visibility, `FG` weather reports and reported ceiling layers define the station fog target. Reports are retrieved independently from the Iowa Environmental Mesonet. Missing/ambiguous observations are not treated as clear conditions. A separate model may learn the altitude of the <strong>base</strong> of reported low BKN/OVC cloud at the airport, using its 5,288 ft MSL field elevation. Cloud <strong>top</strong> cannot be recovered from airport METAR data.</p><p>If independently verified mountain visibility observations are supplied with a timestamp and elevation, a third, elevation-conditioned XGBoost model can learn the joint airport-fog-and-summit-clear outcome. With no such data, the website displays “Not trained” for that outcome.</p></section>
+<section class="card space-y-3"><h2 class="text-xl font-bold">Training and uncertainty</h2><p>Train/validation/test partitions are chronological by forecast valid time, with a 72-hour gap to reduce leakage from overlapping forecast runs. Both fog classifiers can be calibrated on validation events. Holdout Brier, log-loss, ROC AUC and average precision are reported; rare-event class balance and validation selection remain concerns.</p><p>A model with positive GFS temperature gradients is only displaying a <em>forecast inversion signal</em>; there is no independent observed inversion training target yet. Keep the distinction visible in scientific interpretation.</p></section>
+<section class="card"><h2 class="text-xl font-bold mb-3">Primary sources</h2><p><a href="https://open-meteo.com/en/docs/single-runs-api">Open-Meteo Single Runs</a> · <a href="https://open-meteo.com/en/docs/gfs-api">GFS variable documentation</a> · <a href="https://mesonet.agron.iastate.edu/request/download.phtml?network=CO_ASOS">IEM observed METAR</a>. Full reproducibility instructions and caveats are in <a href="https://github.com/samadler8/invert-boulder">the repository README</a>.</p></section></main></body></html>
+</file>
 
-  <!-- TOP HEADER -->
-  <header class="border-b border-slate-800/80 bg-slate-950/90 sticky top-0 z-50 backdrop-blur-md">
-    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-      <div class="flex items-center space-x-3">
-        <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-cyan-600 to-amber-500 flex items-center justify-center">
-          <i class="fa-solid fa-flask text-slate-950 text-xl font-bold"></i>
-        </div>
-        <div>
-          <h1 class="font-extrabold text-lg bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">Inversion Science</h1>
-          <p class="text-xs text-slate-400">Meteorology & Algorithms</p>
-        </div>
-      </div>
-      <!-- Navigation Links -->
-      <nav class="flex space-x-4 text-sm font-semibold">
-        <a href="index.html" class="text-slate-400 hover:text-cyan-400 transition"><i class="fa-solid fa-chart-line mr-1"></i>Dashboard</a>
-        <a href="guide.html" class="text-slate-400 hover:text-cyan-400 transition"><i class="fa-solid fa-book-open mr-1"></i>Guide</a>
-        <a href="science.html" class="text-cyan-400"><i class="fa-solid fa-flask mr-1"></i>Science</a>
-      </nav>
-    </div>
-  </header>
+<file path="xgb_inversion.py">
+"""Compatibility entry point; implementation lives in inversion.models/train."""
+from inversion.models import train_xgb
+from inversion.train import main
 
-  <main class="max-w-4xl mx-auto px-4 py-8 space-y-8 flex-grow">
-    
-    <section class="glass-card rounded-3xl p-8">
-      <h2 class="text-2xl font-extrabold text-white mb-4 border-b border-slate-700 pb-2">What is a Temperature Inversion?</h2>
-      <p class="text-slate-300 leading-relaxed mb-4">
-        Normally, as you climb higher in elevation, the air temperature drops (this is known as the normal lapse rate). A <strong>temperature inversion</strong> occurs when this rule is flipped upside down. A layer of warm air slides over the top of the mountains, acting like a lid. This lid traps cold, moist air down in the valley floor. 
-      </p>
-      <p class="text-slate-300 leading-relaxed">
-        When the temperature of that trapped cold air reaches its dew point, it condenses into a thick deck of fog. If you hike up the mountain, you actually walk from the freezing fog <em>into</em> the warm, sunny air layer above.
-      </p>
-    </section>
-
-    <section class="glass-card rounded-3xl p-8">
-      <h2 class="text-2xl font-extrabold text-white mb-4 border-b border-slate-700 pb-2">How This App Predicts Inversions</h2>
-      <p class="text-slate-300 leading-relaxed mb-6">
-        Because Boulder inversions are notoriously difficult to predict, this dashboard fetches hourly atmospheric sounding data from the <strong>Open-Meteo API</strong>[cite: 3] specifically tailored to Boulder's coordinates (Lat 40.0150, Lon -105.2705)[cite: 3].
-      </p>
-
-      <h3 class="text-lg font-bold text-cyan-400 mb-3">The 5 Core Algorithm Criteria</h3>
-      <p class="text-sm text-slate-300 mb-4">The dashboard calculates a 0-100% Inversion Probability Score based on five strict variables[cite: 3]:</p>
-      
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div class="bg-slate-900 border border-slate-700 p-4 rounded-xl">
-          <h4 class="font-bold text-white text-sm"><i class="fa-solid fa-cloud text-cyan-400 mr-2"></i>1. Low Cloud Cover (Max 35 pts)</h4>
-          <p class="text-xs text-slate-400 mt-1">Evaluates the presence of a saturated airmass sitting directly on the valley floor[cite: 3].</p>
-        </div>
-        <div class="bg-slate-900 border border-slate-700 p-4 rounded-xl">
-          <h4 class="font-bold text-white text-sm"><i class="fa-solid fa-sun text-amber-400 mr-2"></i>2. Upper Sky Clearance (Max 25 pts)</h4>
-          <p class="text-xs text-slate-400 mt-1">Checks mid and high-level cloud cover. A low fog deck isn't visually stunning if the sky above it is also cloudy[cite: 3].</p>
-        </div>
-        <div class="bg-slate-900 border border-slate-700 p-4 rounded-xl">
-          <h4 class="font-bold text-white text-sm"><i class="fa-solid fa-temperature-arrow-up text-rose-400 mr-2"></i>3. Thermal Cap (Max 25 pts)</h4>
-          <p class="text-xs text-slate-400 mt-1">Compares the surface temperature to the 750hPa layer (~8,000 ft). If the air at 8,000 ft is warmer than the surface, a strong inversion lid exists[cite: 3].</p>
-        </div>
-        <div class="bg-slate-900 border border-slate-700 p-4 rounded-xl">
-          <h4 class="font-bold text-white text-sm"><i class="fa-solid fa-droplet text-blue-400 mr-2"></i>4. Moisture Saturation (Max 10 pts)</h4>
-          <p class="text-xs text-slate-400 mt-1">Measures how close the surface temperature is to the dew point, ensuring fog can actually form[cite: 3].</p>
-        </div>
-        <div class="bg-slate-900 border border-slate-700 p-4 rounded-xl md:col-span-2">
-          <h4 class="font-bold text-white text-sm"><i class="fa-solid fa-wind text-emerald-400 mr-2"></i>5. Surface Wind Flow (Max 5 pts / Heavy Penalty)</h4>
-          <p class="text-xs text-slate-400 mt-1">Rewards light easterly (upslope) winds which push plains moisture into the mountains. Strongly penalizes (subtracts 20 points) for westerly downslope Chinook winds over 14mph, which instantly scour the moisture away[cite: 3].</p>
-        </div>
-      </div>
-    </section>
-
-    <section class="glass-card rounded-3xl p-8">
-      <h2 class="text-2xl font-extrabold text-white mb-4 border-b border-slate-700 pb-2">Calculating Cloud Ceiling</h2>
-      <p class="text-slate-300 leading-relaxed mb-4">
-        Once the probability score is generated, the tool attempts to calculate the height of the fog deck (Cloud Ceiling). 
-        It does this by assessing the <strong>temperature delta</strong> (the difference between the surface temp and the temp at 8,100 feet).
-      </p>
-      <ul class="list-disc pl-5 space-y-2 text-slate-300 text-sm">
-        <li><strong>Delta > 2.5°C:</strong> A very strong lid creates a low, compressed cloud deck (~6,700 ft)[cite: 3].</li>
-        <li><strong>Delta > 0°C:</strong> A standard lid creates a mid-level deck (~7,500 ft)[cite: 3].</li>
-        <li><strong>Delta < 0°C:</strong> A weak lid allows moisture to billow high into the mountains (~8,300 ft), socking in the peaks[cite: 3].</li>
-      </ul>
-    </section>
-  </main>
-</body>
-</html>
+if __name__ == '__main__':
+    main()
 </file>
 
 <file path="README.md">
-# 🌁 Boulder Inversion Tracker & Predictor
+# Boulder Inversion Tracker — short-range observation-trained edition
 
-An interactive, real-time web application that predicts temperature inversions and fog decks over Boulder, Colorado. It compares atmospheric conditions across three local elevation landmarks: **City of Boulder (5,400 ft)**, **1st Flatiron Top (7,200 ft)**, and **Green Mountain Summit (8,100 ft)**.
+A local website and two small machine-learning models for **0–<72-hour** forecasts around Boulder, Colorado. Written for a MacBook; trained weights are small enough to commit to GitHub after you train them. **No pretrained model files are included** because independent historical observations and live public API requests have not been downloaded or validated here.
 
-Designed for hikers, trail runners, and photographers looking to catch sunrise above a sea of clouds.
+## What it actually predicts
 
-![HTML5](https://img.shields.io/badge/HTML5-E34F26?style=flat&logo=html5&logoColor=white)
-![TailwindCSS](https://img.shields.io/badge/Tailwind_CSS-38B2AC?style=flat&logo=tailwind-css&logoColor=white)
-![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?style=flat&logo=javascript&logoColor=black)
-![Open-Meteo API](https://img.shields.io/badge/Open--Meteo%20API-Free-blue)
+| Outcome | Ground truth | Trained model | What is shown |
+|---|---|---|---|
+| Airport fog/low ceiling | Independent KBDU airport METAR, conservative binary thresholds | XGBoost + 1D CNN | Calibrated model estimates of that **operational label**, NOT inversion probabilities |
+| Low cloud **base** elevation | Independent METAR `BKN`/`OVC`/`VV` ceiling heights, ft above airport terrain + 5,288 ft MSL | Separate XGBoost regression, **only if enough labels** | Predicted *base* elevation in feet MSL and validation residual band |
+| Scenic cloud sea above individual landmark | Human-verified `observed_summit_clear` at that elevation, joined with independently observed Boulder-area fog | Optional elevation-conditioned XGBoost classifier | Per-landmark scenic-event estimate **only for elevations with training labels** |
+| Atmospheric inversion | No independent vertical soundings included | **Not trained** | GFS-predicted vertical temperature warming diagnostic, NOT probability |
+| Actual cloud top | No reliable cloud-top observations included | **Not trained** | *Unknown*; cloud base must never be mistaken for cloud top |
 
----
+The airport is northeast of downtown Boulder; airport fog != city-center fog. Actual visibility and summit cloud decks may differ significantly across the foothills. A low airport METAR cloud base **cannot** tell us whether a summit is above a cloud layer.
 
-## 🌟 Key Features
+### Why single GFS runs rather than stitched historical forecasts?
 
-* **3D SVG Terrain Cross-Section:** An interactive elevation profile showing whether the City of Boulder, the 1st Flatiron, and Green Mountain summit are in the fog or standing above the clouds.
-* **Open-Meteo API Integration:** Pulls hourly atmospheric sounding data for Boulder (Lat: `40.0150`, Lon: `-105.2705`), including surface temperatures, dew points, relative humidity, wind vectors, and 750hPa pressure-level temps.
-* **5-Factor Scoring Algorithm:** Evaluates low cloud cover, upper-sky clarity, thermal cap strength, surface saturation, and upslope vs. downslope wind dynamics.
-* **Interactive 24-Hour Timeline Chart:** Toggle between **Inversion Probability (%)** and **Cloud Ceiling Elevation (ft)** hour-by-hour.
-* **7-Day Outlook:** Click any day in the extended forecast to inspect its peak morning window.
-* **Scenario Presets:** Instantly test how the application handles classic inversions, high cloud decks, socked-in fog, and downslope Chinook windstorms.
-* **Multi-Page Explanations:** Includes dedicated `guide.html` (usage & terminology) and `science.html` (meteorological math & algorithms).
+Training features use historical **GFS initialization times** from Open-Meteo's **Single Runs API**, released for GFS and most other models from **April 2, 2026**. The valid timestamps are separated from forecast issue timestamps; lead time is an explicit XGBoost feature. Each run includes only forecast lead `0 <= lead < 72` hours (less than three days). This avoids treating hindsight from a stitched near-real-time forecast as though it were an issued 3-day forecast.
 
----
+Historical valid times can appear in several overlapping issued runs. We retain their distinct lead times, and the train/validation/test split is by **valid time** with a 72-hour gap so different predictions verifying the same observation cannot straddle a split. Future improvements should also group synoptic weather events, include lead-stratified evaluation, and reserve a separate calibration set.
 
-## 📂 Repository Structure
+The live server retrieves an actual **initialized GFS run** (after an assumed 7-hour publication lag, with fallbacks to older 6-hour cycles) and discards hours before the current time or with lead >=72. It may show ~54–65 future hours, rather than a full 72 future hours. It does not silently substitute stitched forecasts if an initialized run is missing.
 
-```text
-invert-boulder/
-├── index.html          # Main Dashboard & Interactive Predictor
-├── guide.html          # User Guide & Terminology Page
-├── science.html        # Meteorological Science & Algorithm Docs
-├── README.md           # Project Documentation
-└── .gitignore          # Files to exclude from Git tracking
+This first implementation uses **GFS only** for consistent archive/live input schemas. HRRR may be more useful in the foothills at shorter lead times, but mixing HRRR into a GFS-trained model without a separately aligned archived training pipeline would cause train/serve drift. HRRR's forecast horizon and vertical cloud-cover availability also differ.
+
+## Setup (macOS)
+
+Requires Python 3.11+ and internet access for download or live inference. From the repository root:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+### 1. Download independent airport observations
+
+```bash
+python -m inversion.observations \
+  --start 2026-04-02 --end 2026-10-20 \
+  --output data/observed_bdu.csv
+```
+
+This downloads raw METAR reports from the [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu/request/download.phtml?network=CO_ASOS), selecting station `BDU` in `CO_ASOS`. It keeps observations nearest each UTC hour, independently of the weather model. It stores `observed_fog` as:
+
+- **1**: reported visibility <=1 statute mile *and* fog weather code (`FG`/`FZFG`) or reported low ceiling <=1,000 ft AGL;
+- **0**: visibility >=5 miles and no fog weather code;
+- **blank**: ambiguous or missing (NOT a negative).
+
+The METAR observed low-cloud base is the lowest `BKN`, `OVC`, or `VV` reported layer at <=5,000 ft AGL converted to ft MSL using the airport elevation. That only describes **cloud base**, not cloud top, and may be missing.
+
+**This is a deliberately strict operational proxy for airport fog, not a universal meteorological inversion definition.** Many samples will be unlabeled, and there might not be enough positive cases in the archive. In that case training correctly refuses to produce a model. Inspect `data/observed_bdu.csv` and station sensor continuity before proceeding.
+
+### 2. Train both models on archived issued forecasts
+
+For example, train through October 20, 2026 (leave at least 3 days for verification observations):
+
+```bash
+python -m inversion.train \
+  --start 2026-04-02 --end 2026-10-20 \
+  --observations data/observed_bdu.csv \
+  --run-every-hours 24
+```
+
+`--run-every-hours 24` downloads one 00 UTC run per day; 12 or 6 downloads more forecasts per day, increasing time and disk/network use. Raw run JSON is cached in `data/gfs_runs/` (Git-ignored). HTTP failures stop training instead of fabricating weather input. Some variables or model runs may be unavailable; support depends on provider coverage. To retry, rerun after the outage; completed runs remain cached.
+
+**Requirements for successful training:** At least 150 labeled training examples overall, positive and negative observations in each chronological subset, a meaningful split after 72-hour purges, and complete vertical GFS profiles. If fog is too rare in the available Apr–Oct 2026 archive, the script raises an informative error. Do not try to fix that with synthetic training labels and claim real-world probabilities.
+
+Trained artifacts (automatically generated):
+
+```
+models/
+  xgb.json           airport-fog gradient-boosted trees
+  cnn.pt             vertical-profile CNN + train-only normalizer
+  manifest.json      feature schema, provenance, calibration, test scores
+  cloud_base.json    optional airport low-cloud-base regressor
+  scenic.json        optional labeled elevation-conditioned scenic classifier
+```
+
+The `.gitignore` excludes downloaded raw data but **does not exclude model weights**. Commit trained models only after auditing their data provenance, holdout metrics, and licensing.
+
+### 3. Optional independently labeled summit events
+
+METAR airport reports do **not** tell us whether Green Mountain or the First Flatiron is above the clouds. If you collect independent, timestamped summit camera/hiker observations, save them as a CSV:
+
+```csv
+ timestamp,target_elevation_ft,observed_summit_clear
+ 2026-08-10T12:00:00Z,8100,1
+ 2026-08-10T13:00:00Z,8100,0
+```
+
+The timestamps must be UTC. `observed_summit_clear=1` means the landmark itself is independently observed clear, not necessarily a scenic cloud sea. The scenic **joint** target is `observed_airport_fog AND observed_summit_clear`. We omit the unknown airport-fog hours, rather than treating them as negatives. The altitude is an **explicit model input**, and the optional classifier is trained **only if** its observed labels support a proper chronological split. Only elevations appearing in the training labels are shown as having modeled scenic probabilities (never extrapolate to unverified altitudes automatically).
+
+Train with both sources:
+
+```bash
+python -m inversion.train \
+  --start 2026-04-02 --end 2026-10-20 \
+  --observations data/observed_bdu.csv \
+  --summit-labels data/summit_observations.csv
+```
+
+If summit labels are absent or insufficient, the website says **Not trained**, rather than guessing scenic success. Adding cloud-base observations is **not** a replacement for summit labels.
+
+### 4. Start the local website
+
+```bash
+python -m uvicorn inversion.server:app --reload
+```
+
+Open **http://127.0.0.1:8000**. Other users can download the GitHub repository, install requirements, and use your committed artifacts without retraining. They still need internet to fetch new GFS forecasts (as well as Tailwind/FontAwesome/Google Fonts if not bundled locally).
+
+HTTP endpoints: `/api/health` and `/api/forecast` (`?refresh=true` bypasses the 30-minute forecast response cache). `/api/forecast` includes forecast initialization time, lead time, both fog estimates, optional reported-cloud-base prediction, optional supervised scenic predictions and explicit `null` cloud top. It returns errors when models or live forecast data are unavailable.
+
+## Tests
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+node --check dashboard.js
+```
+
+Tests use **only synthetic fixtures** to check file formats, run lead/time handling, model shapes, conservation of missing labels, model save/load/reload, optional elevation models, and the offline local API. Passing these tests does **NOT** measure scientific forecast skill. The live Open-Meteo/IEM endpoints could not be invoked from the build environment; run these commands on a networked machine and inspect actual responses.
+
+## Architecture
+
+```
+inversion/config.py         Shared schema, elevations, pressure levels, model/version
+inversion/weather.py        Open-Meteo GFS Single Runs HTTP download + cache
+inversion/observations.py   Independent Iowa Mesonet/METAR observation downloader
+inversion/features.py       Vertical interpolation; XGBoost and CNN input schema
+inversion/models.py         XGBoost + small CNN, sigmoid, Platt calibration, metrics
+inversion/train.py          Match issued runs to METAR; chronological split; optional base/scenic targets
+inversion/predict.py        Load exported weights, create model outputs per valid hour/elevation
+inversion/server.py         Local FastAPI and 30-min response caching
+dashboard.js                Interactive short-range dashboard, model caveats, scenarios
+index.html / guide.html / science.html   Site and public documentation
+tests/test_pipeline.py      Offline smoke + integration tests
+```
+
+## Scientific and engineering caveats
+
+1. **Not a verified thermal-inversion classifier.** Airport METAR measures fog/visibility/cloud bases; vertical thermal inversions require independent radiosonde or similar vertical observations. The forecast `forecast_inversion_warming_signal` is simply a GFS temperature-profile diagnostic.
+2. **Not a cloud-top estimator.** The optional regressor predicts a cloud **base** conditional on low-cloud ceiling reports. Its 80% validation residual band is not a conditional conformal prediction interval. It cannot identify the cloud top or a safe hike above clouds.
+3. **Rare events.** Boulder Airport fog events may be too scarce for reliable model fitting or calibration; the short GFS run archive (from April 2026) compounds that limitation. More features cannot repair missing labels.
+4. **Scenic-event dataset.** Hand/automated camera labels need quality control, daylight handling, repeat observations and enough cases across elevations and seasons. No automated webcam scraper is bundled because reliable permission/access and camera placement have not been established.
+5. **Meteorological resolution.** GFS is too coarse for some Front Range topographic effects. HRRR needs its own archive/feature validation before inclusion. Pressure-profile interpolation provides consistent grids, not finer actual measurements.
+6. **Lead-time and deployment.** Forecast run availability can lag initialization (often hours). The site always enforces `<72 hours since issue`, and new weather still requires an internet connection. Weather model updates over time can cause domain shift.
+7. **Evaluations.** Probabilities are calibrated on validation observations. The 72h split purge avoids trivial cross-run leakage but repeated weather-event dependence remains. Test-set Brier/ROC/AP are conditional on the sample selection, not guaranteed generalization. Next measure separate 0–24h, 24–48h and 48–72h performance against raw GFS weather-code/visibility baselines.
+8. **API terms.** Review [Open-Meteo terms](https://open-meteo.com/en/terms) and [IEM terms](https://mesonet.agron.iastate.edu/), and consider attribution, frequency limits and licensing before distributing commercially.
+
+## Source documentation
+
+- [Open-Meteo Single Runs API](https://open-meteo.com/en/docs/single-runs-api) — UTC `run` initialization and run archive dates.
+- [Open-Meteo GFS & HRRR](https://open-meteo.com/en/docs/gfs-api) — forecast variables and GFS variant availability.
+- [Iowa Environmental Mesonet ASOS request](https://mesonet.agron.iastate.edu/request/download.phtml?network=CO_ASOS) — direct METAR observations, `vsby`, `skyc*`, `skyl*`.
+- [Boulder Municipal Airport elevation](https://www.airnav.com/airport/KBDU) — estimated airport field elevation 5,288 ft MSL.
 </file>
 
 </files>
