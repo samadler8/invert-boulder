@@ -116,5 +116,7 @@ def test_local_api_using_offline_live_cache(tmp_path, monkeypatch):
     assert res.status_code == 200, res.text
     body=res.json()
     assert body['model']['target']=='observed_airport_low_ceiling'
-    assert all(r['cloud_top_ft'] is None for r in body['hours'])
-    assert all(0 <= r['probability'] <=1 for r in body['hours'])
+    assert body['model']['ml_available'] is True
+    assert all(0 <= r['heuristic_score'] <= 100 for r in body['hours'])
+    assert all(0 <= r['ml_probability'] <= 1 for r in body['hours'])
+    assert all(r['forecast_cloud_top_ft_msl'] is not None for r in body['hours'])

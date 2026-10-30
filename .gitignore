@@ -38,3 +38,7 @@ data/*.csv
 /models/*.json
 /models/*.pt
 /models/cloud_base_report.json
+
+# Local immutable forecast-vintage ledger
+/data/forecast_history.sqlite3*
+/data/hrrr_live.jsonl.next

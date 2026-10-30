@@ -27,12 +27,20 @@ SURFACE_REGEX = (
     r'LCDC:low cloud layer|MCDC:middle cloud layer|HCDC:high cloud layer|'
     r'HPBL:surface|HGT:cloud base|HGT:cloud top):'
 )
+# About 6-8 km north, south, east, west of the KBDU reference point.
+# These are nearby HRRR grid-cell diagnostics, NOT mountain-point forecasts.
+SPATIAL_CLOUD_POINTS = (
+    ('north', OBS_LAT + .06, OBS_LON),
+    ('south', OBS_LAT - .06, OBS_LON),
+    ('east', OBS_LAT, OBS_LON + .08),
+    ('west', OBS_LAT, OBS_LON - .08),
+)
 PRESSURE_REGEX = (
     r':(?:HGT|TMP|RH|UGRD|VGRD):(?:600|650|700|750|800) mb:'
 )
 
 
-def decode_nearest(path, lat=OBS_LAT, lon=OBS_LON):
+def decode_nearest(path, lat=OBS_LAT, lon=OBS_LON, *, neighbors=None):
     """Return scalar values in GRIB message order (no full-grid arrays stored)."""
     from eccodes import codes_grib_new_from_file, codes_grib_find_nearest, codes_release
     result = []
@@ -40,13 +48,25 @@ def decode_nearest(path, lat=OBS_LAT, lon=OBS_LON):
         while (gid := codes_grib_new_from_file(stream)) is not None:
             try:
                 closest = codes_grib_find_nearest(gid, lat, lon % 360, npoints=1)
-                result.append(float(closest[0].value))
+                center = float(closest[0].value)
+                if neighbors is None:
+                    result.append(center)
+                else:
+                    others = []
+                    for _, near_lat, near_lon in neighbors:
+                        try:
+                            sample = codes_grib_find_nearest(gid, near_lat, near_lon % 360, npoints=1)
+                            value = float(sample[0].value)
+                            others.append(value if math.isfinite(value) else None)
+                        except (ValueError, RuntimeError, IndexError, TypeError, OSError):
+                            others.append(None)
+                    result.append((center, others))
             finally:
                 codes_release(gid)
     return result
 
 
-def download_product(init, fxx, product, pattern, scratch, *, verbose=False):
+def download_product(init, fxx, product, pattern, scratch, *, verbose=False, spatial=False):
     """Use index-based byte-range subsetting; return indexed scalars."""
     from herbie import Herbie
     h = Herbie(init.strftime('%Y-%m-%d %H:%M'), model='hrrr', product=product,
@@ -54,24 +74,30 @@ def download_product(init, fxx, product, pattern, scratch, *, verbose=False):
     inventory = h.inventory(search=pattern)
     if inventory is None or inventory.empty:
         raise RuntimeError(f'No HRRR {product} inventory messages for {init} F{fxx:02d}')
-    path = Path(
-        h.download(
-            pattern,
-            save_dir=scratch,
-            overwrite=True,
-            verbose=verbose,
-            errors="raise",
-        )
-    )
+    path = Path(h.download(pattern, save_dir=scratch, verbose=verbose, errors='raise'))
     try:
-        values = decode_nearest(path)
+        values = decode_nearest(path, neighbors=SPATIAL_CLOUD_POINTS if spatial else None)
         if len(values) != len(inventory):
             raise RuntimeError(f'{product} GRIB fields {len(values)} != index entries {len(inventory)}')
         out = {}
+        samples = {name: {} for name, _, _ in SPATIAL_CLOUD_POINTS} if spatial else None
         for (_, item), val in zip(inventory.iterrows(), values):
             name = str(item['variable']).upper()
             level = str(item['level']).strip().lower()
-            out[(name, level)] = val
+            if spatial:
+                center, neighbors = val
+                out[(name, level)] = center
+                if name in ('LCDC', 'MCDC', 'HCDC'):
+                    for (point_name, _, _), value in zip(SPATIAL_CLOUD_POINTS, neighbors):
+                        samples[point_name][{'LCDC':'low_cloud_pct',
+                                             'MCDC':'mid_cloud_pct',
+                                             'HCDC':'high_cloud_pct'}[name]] = value
+            else:
+                out[(name, level)] = val
+        if spatial:
+            out['_spatial_cloud_samples'] = [
+                {'label': label, 'latitude': lat, 'longitude': lon, **samples[label]}
+                for label, lat, lon in SPATIAL_CLOUD_POINTS]
         return out
     finally:
         # Never retain continental GRIB arrays after point extraction.
@@ -148,10 +174,12 @@ def build_row(init, lead, surface, pressure):
         'features': row.tolist(), 'profile': prof.tolist(),
         'observables': {
             'lowClouds': low, 'midClouds': mid, 'highClouds': high,
+            'spatial_cloud_samples': surface.get('_spatial_cloud_samples'),
             'surfTemp': temp, 'dewPoint': dew, 'rh': humidity,
             'tempDelta': interp(1, ground+302)-temp,
             'windSpeed': math.hypot(u10, v10)*2.23693629, 'windDir': direction,
             'forecast_visibility_m': vis,
+            'forecast_terrain_ft_msl': ground*3.280839895,
             'forecast_boundary_layer_height_m': pbl if math.isfinite(pbl) else None,
             'forecast_cloud_base_ft_msl': cb*3.28084 if math.isfinite(cb) else None,
             'forecast_cloud_top_ft_msl': ct*3.28084 if math.isfinite(ct) else None,
@@ -160,7 +188,7 @@ def build_row(init, lead, surface, pressure):
 
 
 def fetch_point(init, fxx, scratch):
-    s = download_product(init, fxx, 'sfc', SURFACE_REGEX, scratch)
+    s = download_product(init, fxx, 'sfc', SURFACE_REGEX, scratch, spatial=True)
     p = download_product(init, fxx, 'prs', PRESSURE_REGEX, scratch)
     return build_row(init, fxx, s, p)
 
@@ -242,6 +270,7 @@ def main():
     l = sub.add_parser('live', help='Extract a sparse point forecast for local website')
     l.add_argument('--lead-hours', default='6,9,12,15,18,21,24,27,30,33,36,39')
     l.add_argument('--output', type=Path, default=DATA_DIR/'hrrr_live.jsonl')
+    l.add_argument('--morning-hours', default='', help='Optional Boulder local morning hours, e.g. 5,6,7,8,9')
     args = ap.parse_args()
     if args.command == 'inspect':
         inspect(args.date, args.fxx)
@@ -262,11 +291,40 @@ def main():
         candidate = now - timedelta(hours=7)
         init = candidate.replace(hour=(candidate.hour//6)*6, minute=0, second=0, microsecond=0)
         # Drops already elapsed forecast hours. Early runs can have dissemination lag.
-        pairs = [(init, fxx) for fxx in leads if init + timedelta(hours=fxx) > now]
+        # Optionally include exact Boulder dawn hours (rather than only a
+        # sparse set of UTC lead-times) to preserve retrospective verification.
+        if args.morning_hours:
+            from datetime import time
+            from zoneinfo import ZoneInfo
+            from .config import TIMEZONE
+            local_now = now.astimezone(ZoneInfo(TIMEZONE))
+            morning_hours = [int(x) for x in args.morning_hours.split(',')]
+            if any(h < 0 or h > 23 for h in morning_hours):
+                ap.error('--morning-hours values must be 0..23')
+            for day in range(4):
+                local_day = local_now.date() + timedelta(days=day)
+                for hour in morning_hours:
+                    local_target = datetime.combine(local_day, time(hour), tzinfo=ZoneInfo(TIMEZONE))
+                    valid_utc = local_target.astimezone(timezone.utc)
+                    lead = (valid_utc - init).total_seconds() / 3600
+                    if valid_utc > now and lead.is_integer() and 0 <= lead < MAX_LEAD_HOURS:
+                        leads.append(int(lead))
+        pairs = [(init, fxx) for fxx in sorted(set(leads))
+                 if init + timedelta(hours=fxx) > now]
         if not pairs:
             ap.error('No requested lead times are in the future')
-        args.output.unlink(missing_ok=True)
-        collect(pairs, args.output, scratch, max_pairs=None)
+        # Don't destroy a working live forecast cache if a download fails.
+        staging = args.output.with_suffix(args.output.suffix + '.next')
+        staging.unlink(missing_ok=True)
+        collect(pairs, staging, scratch, max_pairs=None)
+        staging.replace(args.output)
+        # Capture the precise instant the complete cache became publishable by
+        # the website, not the earlier partial-download time.
+        from .history import capture_published_live
+        counts = capture_published_live(load_jsonl(args.output),
+                                        published_at=datetime.now(timezone.utc),
+                                        db_path=DATA_DIR / 'forecast_history.sqlite3')
+        print(f'Captured forecast history in data/forecast_history.sqlite3: {counts}')
 
 
 if __name__ == '__main__':

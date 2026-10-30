@@ -6,12 +6,13 @@ DATA_DIR = ROOT / 'data'
 TIMEZONE = 'America/Denver'
 MODEL_SOURCE = 'hrrr'
 MODEL_VERSION = 'hrrr-kbdu-low-ceiling-v4'
-MAX_LEAD_HOURS = 40  # Valid times 0 <= fxx <=39 from issue time
+MAX_LEAD_HOURS = 40  # ML contract: keep existing trained-model semantics unchanged
+DISPLAY_MAX_LEAD_HOURS = 49  # HRRR extended cycles provide f00-f48 for heuristic display
 PRESSURE_LEVELS = (800, 750, 700, 650, 600)
 PROFILE_CHANNELS = ('temperature_c', 'rh_pct', 'u_ms', 'v_ms')
 PROFILE_LEVELS = 25
 PROFILE_TOP_AGL_M = 2000
-LANDMARKS_FT = {'Boulder': 5400, 'First Flatiron': 7200, 'Green Mountain': 8100}
+LANDMARKS_FT = {'Boulder': 5400, 'First Flatiron': 7258, 'Green Mountain': 8133}
 OBS_STATION, OBS_NETWORK = 'BDU', 'CO_ASOS'
 OBS_STATION_ELEV_FT = 5288
 OBS_LAT, OBS_LON = 40.0394, -105.2250
