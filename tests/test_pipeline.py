@@ -4,7 +4,8 @@ import numpy as np
 from pathlib import Path
 import json
 import pytest
-from inversion.hrrr import build_row,historical_pairs,load_jsonl,write_jsonl
+import re
+from inversion.hrrr import build_row,historical_pairs,load_jsonl,write_jsonl,PRESSURE_REGEX
 from inversion.config import FEATURE_NAMES, PROFILE_CHANNELS,MAX_LEAD_HOURS
 from inversion.observations import classify_low_ceiling, parse_iem_csv, save_csv, read_csv
 from inversion.hrrr_train import run_training, rows_and_labels, positive_days
@@ -27,14 +28,16 @@ def hrrr_scalars(fog=False):
         k=f'{pressure} mb'
         p.update({('HGT',k):z,('TMP',k):282.0-(z-1950)*.004 if fog else 275-(z-1950)*.004,
                   ('RH',k):90.0 if fog else 50.0,
-                  ('UGRD',k):3.0,('VGRD',k):-2.0,
-                  ('CLWMR',k):0.0003 if fog else 0.000001})
+                  ('UGRD',k):3.0,('VGRD',k):-2.0})
     return s,p
 
 
 def test_features_and_older_forecast_horizon(tmp_path):
     i=datetime(2025,1,1,tzinfo=timezone.utc)
     s,p=hrrr_scalars(True)
+    assert not any(k[0] == 'CLWMR' for k in p)
+    assert re.search(PRESSURE_REGEX, ':HGT:800 mb:anl:')
+    assert not re.search(PRESSURE_REGEX, ':CLWMR:800 mb:anl:')
     r=build_row(i,36,s,p)
     assert r['features'] and len(r['features'])==len(FEATURE_NAMES)
     assert np.asarray(r['profile']).shape==(len(PROFILE_CHANNELS),25)

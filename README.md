@@ -7,7 +7,7 @@ Municipal Airport (KBDU) METAR observations**. The default binary target is a
 thermodynamic inversion or a proven clear mountain summit. The dense-fog label
 is retained as a separate, much rarer training option.
 
-Models: XGBoost on tabular HRRR fields, 1D CNN on five vertical channels,
+Models: XGBoost on tabular HRRR fields, 1D CNN on four vertical channels,
 independent regression of **reported cloud BASE** (not cloud top). The airport
 is a proxy for the Flatirons; model forecast cloud-base/top heights are predictors,
 not validated outcomes. The website explicitly does **not** claim mountain clearance.
@@ -201,14 +201,14 @@ local inference.
   adds representativeness error even at 3 km grid spacing.
 - KBDU METAR cloud-base is not cloud-top. The HRRR predicted cloud-top field
   is an **input**, not independently verified truth.
-- The CNN uses five pressure levels, interpolated to 25 levels; this is not 25
+- The CNN uses four variables at five pressure levels, interpolated to 25 heights; this is not 25
   independent observations and is not a spatial CNN.
 - The current training sample recipe focuses on 24–39 hour forecast leads;
   the model **must not** be used at untrained leads without fresh validation.
 - Calendar-day grouping and sparse-hour rendering are provisional. A denser
   operational forecast would require training and downloading more leads.
-- We have only verified offline code paths; historical and live HRRR access
-  require the first real `inspect` and `collect` on your Mac.
+- The public HRRR indexes expose the 13 selected surface fields and 25 pressure fields;
+  a real sample download and extraction still need validation on your Mac.
 
 References: [NOAA HRRR](https://rapidrefresh.noaa.gov/hrrr/),
 [Herbie documentation](https://herbie.readthedocs.io/en/latest/),

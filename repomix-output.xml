@@ -47,6 +47,8 @@ inversion/
   __init__.py
   config.py
   features.py
+  hrrr_train.py
+  hrrr.py
   models.py
   observations.py
   predict.py
@@ -55,15 +57,21 @@ inversion/
   weather.py
 models/
   .gitkeep
+scripts/
+  __init__.py
+  data_status.py
 tests/
   test_pipeline.py
 .gitignore
 dashboard.js
 dl_inversion.py
+environment.yml
 guide.html
+HRRR_FIX_NOTES.md
 index.html
 README.md
 requirements-dev.txt
+requirements-hrrr.txt
 requirements.txt
 science.html
 xgb_inversion.py
@@ -72,375 +80,485 @@ xgb_inversion.py
 <files>
 This section contains the contents of the repository's files.
 
-<file path="data/summit_observations_template.txt">
-timestamp,target_elevation_ft,observed_summit_clear
-</file>
+<file path="HRRR_FIX_NOTES.md">
+# HRRR 40-hour extractor v4: CLWMR schema correction
 
-<file path="inversion/observations.py">
-"""Download genuinely independent surface weather observations from IEM METAR.
+This overlay fixes `ValueError: HRRR missing CLWMR at 800 mb`.
+The inspected PRS subset has 25 fields: HGT, TMP, RH, UGRD, VGRD at five pressure levels.
+Cloud-liquid mixing ratio (CLWMR) was not present in that subset, but v3 assumed it was.
 
-Airport fog/ceiling observations are NOT summit cloud-top observations.
-Unknown and ambiguous hours stay unlabeled (never negative by default).
-"""
-import argparse
-import csv
-import io
-import math
-from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
+Changes:
+- Stop requesting CLWMR in the pressure-level subset.
+- Keep four physically sourced CNN channels: temperature, humidity, U wind, V wind.
+- Remove two nonexistent cloud-liquid tabular features.
+- Bump schema version to v4 so incompatible model artifacts cannot be loaded accidentally.
+- Strengthen the offline test: the fixture now has NO CLWMR fields.
 
-import requests
-from .config import (DATA_DIR, OBS_STATION, OBS_NETWORK,
-                     OBS_STATION_ELEV_FT)
-
-IEM_URL = 'https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py'
-CEILING_CODES = {'BKN', 'OVC', 'VV'}
-FOG_CODES = {'FG', 'FZFG'}
-
-
-def parse_num(s):
-    if s is None or str(s).strip().upper() in ('', 'M', 'T', 'NA', 'NULL'):
-        return None
-    try:
-        value = float(str(s).strip())
-        return value if math.isfinite(value) else None
-    except (ValueError, TypeError):
-        return None
-
-
-def observed_cloud_base_ft(report):
-    """Lowest reported BKN/OVC/VV ceiling, meters? No: METAR skyl in ft AGL."""
-    candidates = []
-    for n in range(1, 5):
-        cover = (report.get(f'skyc{n}') or '').strip().upper()
-        height = parse_num(report.get(f'skyl{n}'))
-        if cover in CEILING_CODES and height is not None and 0 <= height <= 5000:
-            candidates.append(height)
-    return (min(candidates) + OBS_STATION_ELEV_FT) if candidates else None
-
-
-def classify_report(report):
-    """Conservative ground-level visibility/low-ceiling fog definition.
-
-    1 if vis<=1 mile and direct FG/FZFG or a reported ceiling <=1000ft AGL.
-    0 if vis>=5 miles and no fog code.
-    else None. Note cloud base is not cloud top, nor does METAR prove an inversion.
-    """
-    vsby = parse_num(report.get('vsby'))
-    wx = (report.get('wxcodes') or '').upper().replace('-', ' ').replace('+', ' ')
-    tokens = set(wx.split())
-    fog = bool(tokens & FOG_CODES)
-    base = observed_cloud_base_ft(report)
-    low_ceiling = base is not None and base - OBS_STATION_ELEV_FT <= 1000
-    if vsby is None:
-        return None
-    if vsby <= 1 and (fog or low_ceiling):
-        return 1
-    if vsby >= 5 and not fog:
-        return 0
-    return None
-
-
-def parse_iem_csv(raw):
-    """Convert unvalidated METAR reports to nearest hour, prefer closest report.
-
-    Rejects duplicate station-hour collisions by choosing the observation closest
-    to the UTC forecast valid time; ties prefer later report.
-    """
-    meaningful = '\n'.join(line for line in raw.splitlines()
-                            if line.strip() and not line.lstrip().startswith('#'))
-    reader = csv.DictReader(io.StringIO(meaningful))
-    if not {'valid', 'vsby', 'station'}.issubset(reader.fieldnames or []):
-        raise ValueError('IEM CSV missing expected valid/vsby/station columns')
-    selected = {}
-    for r in reader:
-        if r.get('station', '').upper().removeprefix('K') != OBS_STATION:
-            continue
-        rawtime = r.get('valid', '').strip()
-        try:
-            at = datetime.fromisoformat(rawtime.replace('Z', '+00:00'))
-            at = at.replace(tzinfo=timezone.utc) if at.tzinfo is None else at.astimezone(timezone.utc)
-        except ValueError:
-            continue
-        closest = (at + timedelta(minutes=30)).replace(minute=0, second=0, microsecond=0)
-        offset = abs((at - closest).total_seconds())
-        if offset > 30 * 60:
-            continue
-        key = closest.isoformat().replace('+00:00', 'Z')
-        priority = (offset, -at.timestamp())
-        if key not in selected or priority < selected[key][0]:
-            selected[key] = (priority, r)
-    results = []
-    for stamp, (_, r) in sorted(selected.items()):
-        label = classify_report(r)
-        base_ft = observed_cloud_base_ft(r)
-        results.append({
-            'timestamp': stamp, 'station': OBS_STATION,
-            'observed_fog': '' if label is None else label,
-            'observed_cloud_base_ft_msl': '' if base_ft is None else round(base_ft),
-            'visibility_miles': '' if parse_num(r.get('vsby')) is None else parse_num(r.get('vsby')),
-            'source': 'IEM METAR (independent station observation)',
-        })
-    return results
-
-
-def download_iem(start, end, *, session=None):
-    """Start inclusive, end inclusive (dates); download query uses exclusive end."""
-    if start > end:
-        raise ValueError('start must precede end')
-    client = session or requests
-    output = []
-    cur = start
-    while cur <= end:
-        stop = min(end + timedelta(days=1), cur + timedelta(days=31))
-        params = [
-            ('station', OBS_STATION), ('network', OBS_NETWORK), ('data', 'all'),
-            ('year1', cur.year), ('month1', cur.month), ('day1', cur.day),
-            ('year2', stop.year), ('month2', stop.month), ('day2', stop.day),
-            ('tz', 'Etc/UTC'), ('format', 'onlycomma'),
-            ('latlon', 'no'), ('elev', 'no'), ('missing', 'M'),
-            ('trace', 'T'), ('direct', 'no'),
-            ('report_type', '3'), ('report_type', '4'),
-        ]
-        response = client.get(IEM_URL, params=params, timeout=120)
-        response.raise_for_status()
-        output.extend(parse_iem_csv(response.text))
-        cur = stop
-    return list({r['timestamp']: r for r in output}.values())
-
-
-def save_csv(records, dest):
-    dest = Path(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    names = ('timestamp', 'station', 'observed_fog', 'observed_cloud_base_ft_msl',
-             'visibility_miles', 'source')
-    with dest.open('w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=names)
-        writer.writeheader()
-        writer.writerows(records)
-
-
-def read_csv(path):
-    records = {}
-    with open(path, newline='') as f:
-        for r in csv.DictReader(f):
-            key = r['timestamp']
-            if key in records:
-                raise ValueError(f'Duplicate station observation hour: {key}')
-            label = (int(r['observed_fog']) if r.get('observed_fog', '') != '' else None)
-            if label not in (None, 0, 1):
-                raise ValueError(f'Invalid observed fog label: {label}')
-            base = parse_num(r.get('observed_cloud_base_ft_msl'))
-            records[key] = {'fog': label, 'cloud_base_ft': base}
-    return records
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--start', type=date.fromisoformat, required=True)
-    parser.add_argument('--end', type=date.fromisoformat, required=True)
-    parser.add_argument('--output', type=Path, default=DATA_DIR / 'observed_bdu.csv')
-    args = parser.parse_args()
-    records = download_iem(args.start, args.end)
-    save_csv(records, args.output)
-    counts = {k: sum(r['observed_fog'] == k for r in records) for k in (0, 1)}
-    print(f'Saved {len(records)} unique reported hours: {counts[1]} fog, {counts[0]} clear; '
-          f'{sum(r["observed_cloud_base_ft_msl"] != "" for r in records)} low cloud-base reports. '
-          f'Unlabeled hours remain unknown. File: {args.output}')
-
-
-if __name__ == '__main__':
-    main()
+Extract over your existing repository; do not delete historical METAR CSVs.
+Retry the 8-sample collection and run data_status before requesting months or years.
+The fix has offline QA but still requires end-to-end GRIB verification on your Mac.
 </file>
 
 <file path="data/.gitkeep">
 
 </file>
 
+<file path="data/summit_observations_template.txt">
+timestamp,target_elevation_ft,observed_summit_clear
+</file>
+
 <file path="inversion/__init__.py">
 """Boulder inversion forecast post-processing package."""
 </file>
 
-<file path="inversion/config.py">
-"""The model contract. Any change to features or heights requires retraining."""
+<file path="inversion/hrrr_train.py">
+"""Train the HRRR postprocessor using independent KBDU METAR labels.
+
+Training inputs MUST come from inversion.hrrr.collect and be matched by valid UTC
+hour to the observation CSV. Duplicate valid hours from different runs stay in
+same chronological partition. No class balancing by inventing observations.
+"""
+import argparse
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-MODEL_DIR = ROOT / 'models'
-DATA_DIR = ROOT / 'data'
-BOULDER_LAT, BOULDER_LON = 40.015, -105.2705
-TIMEZONE = 'America/Denver'
-MODEL_SOURCE = 'gfs_global'
-MODEL_VERSION = 'gfs-run-fog-elevation-v2'
-# The GFS Single Runs archive starts in April 2026; not the stitched historical archive.
-ARCHIVE_START = '2026-04-02T00:00'
-MAX_LEAD_HOURS = 72  # strict bound: 0 <= lead < 72 hours from run initialization
-PRESSURE_LEVELS = (800, 750, 700, 650, 600)
-PROFILE_CHANNELS = ('temperature_c', 'relative_humidity_pct', 'u_wind_ms', 'v_wind_ms', 'pressure_cloud_pct')
-PROFILE_LEVELS = 25
-PROFILE_TOP_AGL_M = 2000
-LANDMARKS_FT = {'Boulder': 5400, 'First Flatiron': 7200, 'Green Mountain': 8100}
-# KBDU airport lies outside downtown Boulder and may have different fog conditions.
-OBS_STATION, OBS_NETWORK = 'BDU', 'CO_ASOS'
-OBS_STATION_ELEV_FT = 5288  # KBDU published airport elevation; geographically distinct from downtown Boulder
-SURFACE_FIELDS = (
-    'temperature_2m', 'dew_point_2m', 'relative_humidity_2m',
-    'cloud_cover_low', 'cloud_cover_mid', 'cloud_cover_high',
-    'wind_speed_10m', 'wind_direction_10m',
-    'visibility', 'weather_code',
-)
-OPTIONAL_FIELDS = ('boundary_layer_height',)
-PROFILE_FIELDS = tuple(
-    f'{kind}_{p}hPa'
-    for p in PRESSURE_LEVELS
-    for kind in ('temperature', 'relative_humidity', 'cloud_cover',
-                 'wind_speed', 'wind_direction', 'geopotential_height')
-)
-HOURLY_FIELDS = SURFACE_FIELDS + OPTIONAL_FIELDS + PROFILE_FIELDS
-FEATURE_NAMES = (
-    'temperature_2m', 'dewpoint_depression', 'relative_humidity_2m',
-    'low_cloud_pct', 'mid_cloud_pct', 'high_cloud_pct',
-    'forecast_visibility_log_m', 'forecast_pbl_height_m',
-    'forecast_fog_weather_code', 'pressure_cloud_300m', 'pressure_cloud_750m',
-    'wind_u_10m_ms', 'wind_v_10m_ms',
-    't_delta_300m', 't_delta_750m', 'rh_300m', 'rh_750m',
-    'wind_u_300m_ms', 'wind_v_300m_ms',
-    'lead_hours', 'hour_sin', 'hour_cos', 'year_sin', 'year_cos',
-)
-SCENIC_FEATURE_NAMES = FEATURE_NAMES + ('target_elevation_ft',)
+import numpy as np
+import torch
+from sklearn.metrics import mean_absolute_error
+from xgboost import XGBRegressor
+
+from .config import (FEATURE_NAMES, PROFILE_CHANNELS, PROFILE_LEVELS,
+                     PROFILE_TOP_AGL_M, MODEL_SOURCE, MODEL_VERSION,
+                     MODEL_DIR, MAX_LEAD_HOURS, OBS_STATION_ELEV_FT)
+from .hrrr import load_jsonl
+from .observations import read_csv
+from .models import (train_xgb, train_cnn, raw_cnn, platt_fit,
+                     platt_apply, metrics)
+
+
+def rows_and_labels(records, observations, target='low_ceiling'):
+    if target not in ('low_ceiling', 'fog'):
+        raise ValueError('Supported targets: low_ceiling or fog')
+    result = []
+    seen = set()
+    for row in records:
+        key = (row['timestamp'], row['run_utc'])
+        if key in seen:
+            raise ValueError(f'Duplicate forecast-run + valid-time pair: {key}')
+        seen.add(key)
+        if not 0 <= row['lead_hours'] < MAX_LEAD_HOURS:
+            continue
+        obs = observations.get(row['timestamp'])
+        if obs is None or obs.get(target) is None:
+            continue
+        transformed = dict(row)
+        transformed['features'] = np.asarray(row['features'], dtype=np.float32)
+        transformed['profile'] = np.asarray(row['profile'], dtype=np.float32)
+        if transformed['features'].shape != (len(FEATURE_NAMES),):
+            raise ValueError('HRRR feature schema changed; rebuild cached rows')
+        if transformed['profile'].shape != (len(PROFILE_CHANNELS), PROFILE_LEVELS):
+            raise ValueError('HRRR CNN channel schema changed; rebuild cached rows')
+        if not np.isfinite(transformed['profile']).all():
+            raise ValueError('NaN in CNN profile')
+        result.append((transformed, int(obs[target])))
+    return sorted(result, key=lambda q: (q[0]['timestamp'], q[0]['run_utc']))
+
+
+def chronological_split(pairs, gap_hours=MAX_LEAD_HOURS):
+    valid_times = sorted({r['timestamp'] for r, _ in pairs})
+    if len(valid_times) < 90:
+        raise ValueError(f'Only {len(valid_times)} uniquely verified hours; need at least 90')
+    p1 = datetime.fromisoformat(valid_times[int(len(valid_times)*0.70)].replace('Z','+00:00'))
+    p2 = datetime.fromisoformat(valid_times[int(len(valid_times)*0.85)].replace('Z','+00:00'))
+    dt = lambda r: datetime.fromisoformat(r['timestamp'].replace('Z','+00:00'))
+    tr = [(r,y) for r,y in pairs if dt(r) < p1-timedelta(hours=gap_hours)]
+    va = [(r,y) for r,y in pairs if p1 <= dt(r) < p2-timedelta(hours=gap_hours)]
+    te = [(r,y) for r,y in pairs if dt(r) >= p2]
+    return tr, va, te
+
+
+def positive_days(part):
+    return len({row['timestamp'][:10] for row,y in part if y == 1})
+
+
+def to_arrays(part):
+    return (np.stack([r['features'] for r,_ in part]),
+            np.stack([r['profile'] for r,_ in part]),
+            np.asarray([y for _,y in part], dtype=np.int64))
+
+
+def cloud_base_model(records, observations, dest, min_unique_hours=90):
+    unique = {}
+    for row in records:
+        obs = observations.get(row['timestamp'])
+        if obs is not None and obs.get('cloud_base_ft') is not None:
+            x = np.asarray(row['features'], dtype=np.float32)
+            unique[(row['timestamp'],row['run_utc'])] = (row, float(obs['cloud_base_ft']))
+    pairs = sorted(unique.values(),key=lambda p:p[0]['timestamp'])
+    if len({r['timestamp'] for r,_ in pairs}) < min_unique_hours:
+        return {'available':False,'reason':'Insufficient unique independently reported cloud-base hours'}
+    tr, va, te = chronological_split(pairs)
+    if min(map(len,(tr,va,te))) < 15:
+        return {'available':False,'reason':'Insufficient independent cloud-base examples after temporal splits'}
+    xtr=np.stack([r['features'] for r,_ in tr]); ytr=np.asarray([y for _,y in tr])
+    xva=np.stack([r['features'] for r,_ in va]); yva=np.asarray([y for _,y in va])
+    xte=np.stack([r['features'] for r,_ in te]); yte=np.asarray([y for _,y in te])
+    reg=XGBRegressor(n_estimators=180,max_depth=3,learning_rate=.04,
+                     tree_method='hist',n_jobs=4,random_state=42)
+    reg.fit(xtr,ytr)
+    residual=np.abs(reg.predict(xva)-yva)
+    margin=float(np.quantile(residual,.8))
+    dest.mkdir(parents=True,exist_ok=True)
+    reg.save_model(str(dest/'cloud_base.json'))
+    return {'available':True,'target':'reported KBDU cloud BASE, feet MSL; conditional on reported ceiling',
+            'validation_80pct_abs_residual_ft':margin,
+            'test_mae_ft':float(mean_absolute_error(yte,reg.predict(xte))),
+            'distinct_valid_hours':len({r['timestamp'] for r,_ in pairs}),
+            'warning':'Airport cloud base is not cloud top or scenic clearance.'}
+
+
+def run_training(rows, observations, dest, target='low_ceiling', epochs=25, estimators=300,
+                 base_only=False):
+    dest=Path(dest)
+    dest.mkdir(parents=True,exist_ok=True)
+    base=cloud_base_model(rows, observations, dest)
+    if base_only:
+        (dest/'cloud_base_report.json').write_text(json.dumps(base,indent=2)+'\n')
+        return {'cloud_base':base, 'note':'Other models not trained by --base-only'}
+    pairs=rows_and_labels(rows,observations,target)
+    if len(pairs) < 200:
+        raise ValueError(f'Only {len(pairs)} labeled forecast examples. Fetch a longer historical period.')
+    tr,va,te=chronological_split(pairs)
+    for name,part in [('train',tr),('validation',va),('test',te)]:
+        days=positive_days(part)
+        if days < 3:
+            raise ValueError(f'{name} has only {days} independent positive calendar days; '
+                             'collect more winters before fitting probabilities')
+    xtr,ptr,ytr=to_arrays(tr)
+    xva,pva,yva=to_arrays(va)
+    xte,pte,yte=to_arrays(te)
+    xgb=train_xgb(xtr,ytr,xva,yva,estimators=estimators)
+    cnn,mean,scale,details=train_cnn(ptr,ytr,pva,yva,epochs=epochs)
+    xc=platt_fit(xgb.predict_proba(xva)[:,1],yva)
+    cc=platt_fit(raw_cnn(cnn,pva,mean,scale),yva)
+    xp=platt_apply(xgb.predict_proba(xte)[:,1],xc)
+    cp=platt_apply(raw_cnn(cnn,pte,mean,scale),cc)
+    ens=(xp+cp)/2
+    report={'xgb':metrics(yte,xp),'cnn':metrics(yte,cp),'ensemble':metrics(yte,ens)}
+    seen_leads=sorted({int(r['lead_hours']) for r,_ in pairs})
+    manifest={
+        'version':MODEL_VERSION, 'data_model':MODEL_SOURCE,
+        'target':'observed_airport_'+target, 'verified_observations':True,
+        'observation_station':'KBDU / Boulder Municipal Airport',
+        'max_lead_hours_exclusive':MAX_LEAD_HOURS,
+        'weather_archive':'NOAA HRRR issued GRIB2 cycles via Herbie indexed subsets',
+        'features':list(FEATURE_NAMES), 'channels':list(PROFILE_CHANNELS),
+        'profile_levels':PROFILE_LEVELS,'profile_top_agl_m':PROFILE_TOP_AGL_M,
+        'calibration':{'xgb':xc,'cnn':cc},'cnn_training':details,
+        'cloud_base':base,
+        'scenic':{'available':False,'reason':'No independently verified summit image labels'},
+        'trained_lead_hours':seen_leads,
+        'test_metrics':report,
+        'dataset':{'distinct_valid_hours':len({r['timestamp'] for r,_ in pairs}),
+                   'rows':len(pairs),'positive_days':positive_days(pairs),
+                   'train_positive_days':positive_days(tr),
+                   'validation_positive_days':positive_days(va),
+                   'test_positive_days':positive_days(te)},
+        'disclaimer':('Experimental HRRR-based, observation-trained airport low ceiling/fog. '
+                      'NOT a verified temperature inversion or mountain-above-cloud probability. '
+                      'Calibration is preliminary and rare weather events may be underrepresented.'),
+    }
+    xgb.save_model(str(dest/'xgb.json'))
+    torch.save({'state_dict':cnn.state_dict(),'mean':torch.tensor(mean),
+                'scale':torch.tensor(scale)}, str(dest/'cnn.pt'))
+    (dest/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+    return manifest
+
+
+def main():
+    ap=argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--features',type=Path,default=Path('data/hrrr_samples.jsonl'))
+    ap.add_argument('--observations',type=Path,required=True)
+    ap.add_argument('--target',choices=['low_ceiling','fog'],default='low_ceiling')
+    ap.add_argument('--model-dir',type=Path,default=MODEL_DIR)
+    ap.add_argument('--epochs',type=int,default=25)
+    ap.add_argument('--base-only',action='store_true')
+    a=ap.parse_args()
+    result=run_training(load_jsonl(a.features),read_csv(a.observations),a.model_dir,
+                        target=a.target,epochs=a.epochs,base_only=a.base_only)
+    print(json.dumps(result,indent=2))
+
+if __name__=='__main__':
+    main()
 </file>
 
-<file path="inversion/features.py">
-"""Shared train/serve transformation of initialized forecasts into rows."""
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+<file path="inversion/hrrr.py">
+"""Download *selected* HRRR GRIB messages, extract KBDU grid-point scalars,
+and discard temporary GRIB files. Requires Herbie and ecCodes.
+
+Examples:
+  python -m inversion.hrrr inspect --date 2025-01-15 --fxx 36
+  python -m inversion.hrrr collect --start 2025-01-15 --end 2025-01-16 --lead-hours 24,30,36
+  python -m inversion.hrrr live --lead-hours 12,18,24,30,36,39
+
+Do not download full CONUS GRIB files; use only indexed message subsets.
+"""
+import argparse
+import json
 import math
+from datetime import datetime, date, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
 import numpy as np
+from .config import (DATA_DIR, OBS_LAT, OBS_LON, TIMEZONE, MAX_LEAD_HOURS,
+                     PRESSURE_LEVELS, PROFILE_LEVELS, PROFILE_TOP_AGL_M,
+                     FEATURE_NAMES)
 
-from .config import (FEATURE_NAMES, PRESSURE_LEVELS, PROFILE_LEVELS,
-                     PROFILE_TOP_AGL_M, SURFACE_FIELDS, PROFILE_FIELDS,
-                     TIMEZONE, MAX_LEAD_HOURS)
-
-
-def utcparse(s):
-    dt = datetime.fromisoformat(s.replace('Z', '+00:00'))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)  # Open-Meteo times requested as UTC
-    return dt.astimezone(timezone.utc)
-
-
-def uv(speed_kmh, bearing_deg):
-    angle = math.radians(float(bearing_deg))
-    speed = float(speed_kmh) / 3.6
-    return -speed * math.sin(angle), -speed * math.cos(angle)
+# Search expressions are matched against the NOAA .idx inventory, NOT full GRIB bytes.
+SURFACE_REGEX = (
+    r':(?:VIS:surface|HGT:surface|TMP:2 m above ground|DPT:2 m above ground|'
+    r'RH:2 m above ground|UGRD:10 m above ground|VGRD:10 m above ground|'
+    r'LCDC:low cloud layer|MCDC:middle cloud layer|HCDC:high cloud layer|'
+    r'HPBL:surface|HGT:cloud base|HGT:cloud top):'
+)
+PRESSURE_REGEX = (
+    r':(?:HGT|TMP|RH|UGRD|VGRD):(?:600|650|700|750|800) mb:'
+)
 
 
-def row_at(data, i):
-    """None if missing/out-of-horizon; no guessed fields or zero-imputation."""
-    h = data.get('hourly', {})
+def decode_nearest(path, lat=OBS_LAT, lon=OBS_LON):
+    """Return scalar values in GRIB message order (no full-grid arrays stored)."""
+    from eccodes import codes_grib_new_from_file, codes_grib_find_nearest, codes_release
+    result = []
+    with open(path, 'rb') as stream:
+        while (gid := codes_grib_new_from_file(stream)) is not None:
+            try:
+                closest = codes_grib_find_nearest(gid, lat, lon % 360, npoints=1)
+                result.append(float(closest[0].value))
+            finally:
+                codes_release(gid)
+    return result
+
+
+def download_product(init, fxx, product, pattern, scratch, *, verbose=False):
+    """Use index-based byte-range subsetting; return indexed scalars."""
+    from herbie import Herbie
+    h = Herbie(init.strftime('%Y-%m-%d %H:%M'), model='hrrr', product=product,
+               fxx=fxx, verbose=verbose)
+    inventory = h.inventory(search=pattern)
+    if inventory is None or inventory.empty:
+        raise RuntimeError(f'No HRRR {product} inventory messages for {init} F{fxx:02d}')
+    path = Path(h.download(pattern, save_dir=scratch, verbose=verbose, errors='raise'))
     try:
-        init = utcparse(data['_run_utc'])
-        timestamp = utcparse(h['time'][i])
-        lead = (timestamp - init).total_seconds() / 3600
-        if not 0 <= lead < MAX_LEAD_HOURS:
-            return None
-        values = {k: float(h[k][i]) for k in SURFACE_FIELDS + PROFILE_FIELDS}
-        if not all(np.isfinite(v) for v in values.values()):
-            return None
-        # Some GFS sub-products omit boundary-layer height; XGBoost handles NaN.
-        pbl = h.get('boundary_layer_height', [None] * len(h['time']))[i]
-        pbl = float(pbl) if pbl is not None else float('nan')
-        local = timestamp.astimezone(ZoneInfo(TIMEZONE))
-        z_ground = float(data['elevation'])
-        z_surface = z_ground + 2
-        zs = [z_surface]
-        t = [values['temperature_2m']]
-        rh = [values['relative_humidity_2m']]
-        u0, v0 = uv(values['wind_speed_10m'], values['wind_direction_10m'])
-        u, v = [u0], [v0]
-        # Cloud cover at ground is NOT a pressure-level measurement.
-        cp_z, cp_values = [], []
-        for p in PRESSURE_LEVELS:
-            z = values[f'geopotential_height_{p}hPa']
-            if z < z_surface + 5:
-                continue
-            up, vp = uv(values[f'wind_speed_{p}hPa'], values[f'wind_direction_{p}hPa'])
-            zs.append(z)
-            t.append(values[f'temperature_{p}hPa'])
-            rh.append(values[f'relative_humidity_{p}hPa'])
-            u.append(up)
-            v.append(vp)
-            cp_z.append(z)
-            cp_values.append(values[f'cloud_cover_{p}hPa'])
-        order = np.argsort(zs)
-        heights = np.asarray(zs)[order]
-        if len(heights) < 4 or heights[-1] < z_surface + PROFILE_TOP_AGL_M:
-            return None
-        if np.any(np.diff(heights) < 1):
-            return None
-        if len(cp_z) < 2:
-            return None
-        def interp(channel, height):
-            return float(np.interp(height, heights, np.asarray(channel)[order]))
-        grid = np.linspace(z_surface, z_surface + PROFILE_TOP_AGL_M,
-                           PROFILE_LEVELS, dtype=np.float32)
-        profile = np.stack([
-            *[np.interp(grid, heights, np.asarray(ch)[order]) for ch in (t, rh, u, v)],
-            np.interp(grid, cp_z, cp_values),
-        ]).astype(np.float32)
-        # Boundary held constant only for below-first-pressure-level cloud cover;
-        # this is model interpolation, not new independent observations.
-        cp300 = float(np.interp(z_surface + 300, cp_z, cp_values))
-        cp750 = float(np.interp(z_surface + 750, cp_z, cp_values))
-        year_phase = 2 * math.pi * (local.timetuple().tm_yday / 365.25)
-        hour_phase = 2 * math.pi * (local.hour / 24)
-        features = np.asarray([
-            values['temperature_2m'], values['temperature_2m'] - values['dew_point_2m'],
-            values['relative_humidity_2m'],
-            values['cloud_cover_low'], values['cloud_cover_mid'], values['cloud_cover_high'],
-            math.log1p(max(0.0, values['visibility'])),
-            pbl,
-            float(int(values['weather_code']) in (45, 48)),
-            cp300, cp750, u0, v0,
-            interp(t, z_surface + 300) - t[0],
-            interp(t, z_surface + 750) - t[0],
-            interp(rh, z_surface + 300), interp(rh, z_surface + 750),
-            interp(u, z_surface + 300), interp(v, z_surface + 300),
-            lead, math.sin(hour_phase), math.cos(hour_phase),
-            math.sin(year_phase), math.cos(year_phase),
-        ], dtype=np.float32)
-        assert len(features) == len(FEATURE_NAMES)
-        return {
-            'timestamp': timestamp.isoformat().replace('+00:00', 'Z'),
-            'run_utc': init.isoformat().replace('+00:00', 'Z'),
-            'lead_hours': lead,
-            'local_time': local.isoformat(),
-            'features': features,
-            'profile': profile,
-            'observables': {
-                'lowClouds': values['cloud_cover_low'],
-                'midClouds': values['cloud_cover_mid'],
-                'highClouds': values['cloud_cover_high'],
-                'surfTemp': values['temperature_2m'],
-                'dewPoint': values['dew_point_2m'],
-                'rh': values['relative_humidity_2m'],
-                'tempDelta': interp(t, z_surface + 300) - t[0],
-                'windSpeed': values['wind_speed_10m'] / 1.609344,
-                'windDir': values['wind_direction_10m'],
-                'forecast_visibility_m': values['visibility'],
-                'forecast_boundary_layer_height_m': float(pbl) if np.isfinite(pbl) else None,
-                'forecast_pressure_cloud_300m': cp300,
-                'forecast_pressure_cloud_750m': cp750,
-                'forecast_weather_code': int(values['weather_code']),
-            },
+        values = decode_nearest(path)
+        if len(values) != len(inventory):
+            raise RuntimeError(f'{product} GRIB fields {len(values)} != index entries {len(inventory)}')
+        out = {}
+        for (_, item), val in zip(inventory.iterrows(), values):
+            name = str(item['variable']).upper()
+            level = str(item['level']).strip().lower()
+            out[(name, level)] = val
+        return out
+    finally:
+        # Never retain continental GRIB arrays after point extraction.
+        path.unlink(missing_ok=True)
+
+
+def require(fields, variable, level):
+    key = (variable, level)
+    if key not in fields or not math.isfinite(fields[key]):
+        raise ValueError(f'HRRR missing {variable} at {level}; index fields were {list(fields)[:8]}')
+    return fields[key]
+
+
+def build_row(init, lead, surface, pressure):
+    """Transform decoded HRRR scalars to common XGBoost and CNN input schema."""
+    valid = init + timedelta(hours=lead)
+    local = valid.astimezone(ZoneInfo(TIMEZONE))
+    temp = require(surface, 'TMP', '2 m above ground') - 273.15
+    dew = require(surface, 'DPT', '2 m above ground') - 273.15
+    humidity = require(surface, 'RH', '2 m above ground')
+    u10 = require(surface, 'UGRD', '10 m above ground')
+    v10 = require(surface, 'VGRD', '10 m above ground')
+    ground = require(surface, 'HGT', 'surface')
+    vis = require(surface, 'VIS', 'surface')
+    low = require(surface, 'LCDC', 'low cloud layer')
+    mid = require(surface, 'MCDC', 'middle cloud layer')
+    high = require(surface, 'HCDC', 'high cloud layer')
+    pbl = surface.get(('HPBL', 'surface'), float('nan'))
+    cb = surface.get(('HGT', 'cloud base'), float('nan'))
+    ct = surface.get(('HGT', 'cloud top'), float('nan'))
+    def sane_height(value):
+        return value if math.isfinite(value) and ground <= value <= 16000 else float('nan')
+    cb, ct = sane_height(cb), sane_height(ct)
+    # Output is from model grid; pressure levels under local terrain are excluded.
+    layers = [(ground + 2.0, temp, humidity, u10, v10)]
+    for level in PRESSURE_LEVELS:
+        key = f'{level} mb'
+        z = require(pressure, 'HGT', key)
+        if z <= ground + 10:
+            continue
+        layers.append((z, require(pressure, 'TMP', key) - 273.15,
+                       require(pressure, 'RH', key), require(pressure, 'UGRD', key),
+                       require(pressure, 'VGRD', key)))
+    layers.sort()
+    if len(layers) < 4 or layers[-1][0] < ground + 2 + PROFILE_TOP_AGL_M:
+        raise ValueError('Not enough above-ground HRRR pressure levels for 2 km profile')
+    zs = np.asarray([r[0] for r in layers], dtype=float)
+    if np.min(np.diff(zs)) < 1:
+        raise ValueError('Degenerate pressure-level geopotential heights')
+    zgrid = np.linspace(ground + 2, ground + 2 + PROFILE_TOP_AGL_M, PROFILE_LEVELS)
+    interp = lambda column, z: float(np.interp(z, zs, [r[column] for r in layers]))
+    # Four independently supplied vertical fields. CLWMR is not in the
+    # retrieved pressure inventory, so do not invent a fifth profile channel.
+    prof = np.asarray([
+        [interp(k, z) for z in zgrid] for k in range(1, 5)
+    ], dtype=np.float32)
+    hr = 2 * math.pi * (local.hour / 24)
+    yr = 2 * math.pi * (local.timetuple().tm_yday / 365.25)
+    row = np.asarray([
+        temp, temp - dew, humidity, low, mid, high, math.log1p(max(0, vis)),
+        pbl, cb, ct, u10, v10,
+        interp(1, ground+302) - temp, interp(1, ground+752) - temp,
+        interp(2, ground+302), interp(2, ground+752),
+        interp(3, ground+302), interp(4, ground+302),
+        float(lead), math.sin(hr), math.cos(hr), math.sin(yr), math.cos(yr)
+    ], dtype=np.float32)
+    if len(row) != len(FEATURE_NAMES) or not np.isfinite(prof).all():
+        raise ValueError('Invalid HRRR feature/profile dimensions or values')
+    direction = math.degrees(math.atan2(-u10, -v10)) % 360
+    return {
+        'timestamp': valid.isoformat().replace('+00:00', 'Z'),
+        'run_utc': init.isoformat().replace('+00:00', 'Z'),
+        'lead_hours': float(lead), 'local_time': local.isoformat(),
+        'features': row.tolist(), 'profile': prof.tolist(),
+        'observables': {
+            'lowClouds': low, 'midClouds': mid, 'highClouds': high,
+            'surfTemp': temp, 'dewPoint': dew, 'rh': humidity,
+            'tempDelta': interp(1, ground+302)-temp,
+            'windSpeed': math.hypot(u10, v10)*2.23693629, 'windDir': direction,
+            'forecast_visibility_m': vis,
+            'forecast_boundary_layer_height_m': pbl if math.isfinite(pbl) else None,
+            'forecast_cloud_base_ft_msl': cb*3.28084 if math.isfinite(cb) else None,
+            'forecast_cloud_top_ft_msl': ct*3.28084 if math.isfinite(ct) else None,
         }
-    except (ValueError, KeyError, IndexError, TypeError, AssertionError):
-        return None
+    }
 
 
-def rows_from_data(response):
-    return [r for i in range(len(response.get('hourly', {}).get('time', [])))
-            if (r := row_at(response, i)) is not None]
+def fetch_point(init, fxx, scratch):
+    s = download_product(init, fxx, 'sfc', SURFACE_REGEX, scratch)
+    p = download_product(init, fxx, 'prs', PRESSURE_REGEX, scratch)
+    return build_row(init, fxx, s, p)
+
+
+def load_jsonl(path):
+    if not Path(path).exists():
+        return []
+    with open(path) as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+
+
+def write_jsonl(path, rows, mode='a'):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, mode) as stream:
+        for row in rows:
+            stream.write(json.dumps(row, allow_nan=True) + '\n')
+
+
+def historical_pairs(start, end, run_hour, leads):
+    cur = start
+    while cur <= end:
+        init = datetime(cur.year, cur.month, cur.day, run_hour, tzinfo=timezone.utc)
+        for lead in leads:
+            if not 0 <= lead < MAX_LEAD_HOURS:
+                raise ValueError('Lead must be 0..39 hours')
+            # HRRRv3 extended runs were only 36h; HRRRv4 began 2020-12-02.
+            if init < datetime(2020, 12, 2, tzinfo=timezone.utc) and lead > 36:
+                continue
+            yield init, lead
+        cur += timedelta(days=1)
+
+
+def collect(pairs, output, scratch, max_pairs=8):
+    output = Path(output)
+    seen = {(r['run_utc'], int(r['lead_hours'])) for r in load_jsonl(output)}
+    completed = 0
+    for init, fxx in pairs:
+        key = (init.isoformat().replace('+00:00', 'Z'), fxx)
+        if key in seen:
+            continue
+        if max_pairs is not None and completed >= max_pairs:
+            break
+        print(f'HRRR {init:%Y-%m-%d %HZ} F{fxx:02d} -> {output}', flush=True)
+        row = fetch_point(init, fxx, scratch)
+        write_jsonl(output, [row])
+        completed += 1
+        seen.add(key)
+    print(f'New pairs: {completed}; total in cache: {len(seen)}; JSONL: {output}')
+
+
+def inspect(date_str, fxx):
+    from herbie import Herbie
+    init = datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc)
+    for product, regex in (('sfc', SURFACE_REGEX), ('prs', PRESSURE_REGEX)):
+        h = Herbie(init.strftime('%Y-%m-%d %H:%M'), model='hrrr',
+                   product=product, fxx=fxx)
+        inv = h.inventory(search=regex)
+        if inv is None or inv.empty:
+            raise RuntimeError(f'No {product} fields matched')
+        print(f'\n{product}: {len(inv)} indexed fields to selectively download')
+        print(inv[['variable','level']].to_string(index=False))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    sub = ap.add_subparsers(dest='command', required=True)
+    i = sub.add_parser('inspect', help='Only inspect .idx, zero GRIB data downloaded')
+    i.add_argument('--date', default='2025-01-15')
+    i.add_argument('--fxx', type=int, default=36)
+    c = sub.add_parser('collect', help='Historical HRRR point samples; resumable')
+    c.add_argument('--start', type=date.fromisoformat, required=True)
+    c.add_argument('--end', type=date.fromisoformat, required=True)
+    c.add_argument('--run-hour', type=int, choices=[0,6,12,18], default=0)
+    c.add_argument('--lead-hours', default='24,30,36')
+    c.add_argument('--output', type=Path, default=DATA_DIR/'hrrr_samples.jsonl')
+    c.add_argument('--max-pairs', type=int, default=8, help='Safety cap per invocation; default 8')
+    c.add_argument('--all', action='store_true', help='Explicitly disable per-run limit')
+    l = sub.add_parser('live', help='Extract a sparse point forecast for local website')
+    l.add_argument('--lead-hours', default='6,9,12,15,18,21,24,27,30,33,36,39')
+    l.add_argument('--output', type=Path, default=DATA_DIR/'hrrr_live.jsonl')
+    args = ap.parse_args()
+    if args.command == 'inspect':
+        inspect(args.date, args.fxx)
+        return
+    leads = [int(x) for x in args.lead_hours.split(',')]
+    if any(n < 0 or n >= MAX_LEAD_HOURS for n in leads):
+        ap.error('Allowed lead hours are 0 to 39')
+    scratch = DATA_DIR/'hrrr_tmp'
+    if args.command == 'collect':
+        if args.start > args.end:
+            ap.error('--end must follow --start')
+        if datetime.combine(args.end, datetime.min.time(), tzinfo=timezone.utc) > datetime.now(timezone.utc) - timedelta(days=3):
+            ap.error('Historical verification needs run dates at least 3 days old')
+        pairs = historical_pairs(args.start, args.end, args.run_hour, leads)
+        collect(pairs, args.output, scratch, None if args.all else args.max_pairs)
+    else:
+        now = datetime.now(timezone.utc)
+        candidate = now - timedelta(hours=7)
+        init = candidate.replace(hour=(candidate.hour//6)*6, minute=0, second=0, microsecond=0)
+        # Drops already elapsed forecast hours. Early runs can have dissemination lag.
+        pairs = [(init, fxx) for fxx in leads if init + timedelta(hours=fxx) > now]
+        if not pairs:
+            ap.error('No requested lead times are in the future')
+        args.output.unlink(missing_ok=True)
+        collect(pairs, args.output, scratch, max_pairs=None)
+
+
+if __name__ == '__main__':
+    main()
 </file>
 
 <file path="inversion/models.py">
@@ -570,6 +688,312 @@ def metrics(y_true, probs):
     return values
 </file>
 
+<file path="inversion/observations.py">
+"""Download genuinely independent surface weather observations from IEM METAR.
+
+Airport fog/ceiling observations are NOT summit cloud-top observations.
+Unknown and ambiguous hours stay unlabeled (never negative by default).
+"""
+import argparse
+import csv
+import io
+import math
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+import requests
+from .config import (DATA_DIR, OBS_STATION, OBS_NETWORK,
+                     OBS_STATION_ELEV_FT)
+
+IEM_URL = 'https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py'
+CEILING_CODES = {'BKN', 'OVC', 'VV'}
+FOG_CODES = {'FG', 'FZFG'}
+
+
+def parse_num(s):
+    if s is None or str(s).strip().upper() in ('', 'M', 'T', 'NA', 'NULL'):
+        return None
+    try:
+        value = float(str(s).strip())
+        return value if math.isfinite(value) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def observed_cloud_base_ft(report):
+    """Lowest reported BKN/OVC/VV ceiling, meters? No: METAR skyl in ft AGL."""
+    candidates = []
+    for n in range(1, 5):
+        cover = (report.get(f'skyc{n}') or '').strip().upper()
+        height = parse_num(report.get(f'skyl{n}'))
+        if cover in CEILING_CODES and height is not None and 0 <= height <= 5000:
+            candidates.append(height)
+    return (min(candidates) + OBS_STATION_ELEV_FT) if candidates else None
+
+
+def classify_report(report):
+    """Conservative ground-level visibility/low-ceiling fog definition.
+
+    1 if vis<=1 mile and direct FG/FZFG or a reported ceiling <=1000ft AGL.
+    0 if vis>=5 miles and no fog code.
+    else None. Note cloud base is not cloud top, nor does METAR prove an inversion.
+    """
+    vsby = parse_num(report.get('vsby'))
+    wx = (report.get('wxcodes') or '').upper().replace('-', ' ').replace('+', ' ')
+    tokens = set(wx.split())
+    fog = bool(tokens & FOG_CODES)
+    base = observed_cloud_base_ft(report)
+    low_ceiling = base is not None and base - OBS_STATION_ELEV_FT <= 1000
+    if vsby is None:
+        return None
+    if vsby <= 1 and (fog or low_ceiling):
+        return 1
+    if vsby >= 5 and not fog:
+        return 0
+    return None
+
+
+
+def classify_low_ceiling(report, threshold_agl_ft=1000):
+    """Strict station low-ceiling target: 1 if BKN/OVC/VV <=threshold AGL.
+
+    0 if sky layers were reported and none qualifies. Missing sky reports remain
+    unknown, including clear-visibility-only reports.
+    """
+    sky_codes = [(report.get(f'skyc{n}') or '').strip().upper() for n in range(1, 5)]
+    valid = {'CLR', 'SKC', 'FEW', 'SCT', 'BKN', 'OVC', 'VV', 'NSC', 'NCD'}
+    if not any(code in valid for code in sky_codes):
+        return None
+    for n, code in enumerate(sky_codes, 1):
+        if code in CEILING_CODES:
+            height = parse_num(report.get(f'skyl{n}'))
+            if height is not None and 0 <= height <= threshold_agl_ft:
+                return 1
+    # A VV code without a numeric height cannot confirm absence of low ceiling.
+    if 'VV' in sky_codes and not any(parse_num(report.get(f'skyl{n}')) is not None
+                                      for n, code in enumerate(sky_codes, 1) if code == 'VV'):
+        return None
+    return 0
+
+def parse_iem_csv(raw):
+    """Convert unvalidated METAR reports to nearest hour, prefer closest report.
+
+    Rejects duplicate station-hour collisions by choosing the observation closest
+    to the UTC forecast valid time; ties prefer later report.
+    """
+    meaningful = '\n'.join(line for line in raw.splitlines()
+                            if line.strip() and not line.lstrip().startswith('#'))
+    reader = csv.DictReader(io.StringIO(meaningful))
+    if not {'valid', 'vsby', 'station'}.issubset(reader.fieldnames or []):
+        raise ValueError('IEM CSV missing expected valid/vsby/station columns')
+    selected = {}
+    for r in reader:
+        if r.get('station', '').upper().removeprefix('K') != OBS_STATION:
+            continue
+        rawtime = r.get('valid', '').strip()
+        try:
+            at = datetime.fromisoformat(rawtime.replace('Z', '+00:00'))
+            at = at.replace(tzinfo=timezone.utc) if at.tzinfo is None else at.astimezone(timezone.utc)
+        except ValueError:
+            continue
+        closest = (at + timedelta(minutes=30)).replace(minute=0, second=0, microsecond=0)
+        offset = abs((at - closest).total_seconds())
+        if offset > 30 * 60:
+            continue
+        key = closest.isoformat().replace('+00:00', 'Z')
+        priority = (offset, -at.timestamp())
+        if key not in selected or priority < selected[key][0]:
+            selected[key] = (priority, r)
+    results = []
+    for stamp, (_, r) in sorted(selected.items()):
+        label = classify_report(r)
+        base_ft = observed_cloud_base_ft(r)
+        results.append({
+            'timestamp': stamp, 'station': OBS_STATION,
+            'observed_fog': '' if label is None else label,
+            'observed_low_ceiling': '' if classify_low_ceiling(r) is None else classify_low_ceiling(r),
+            'observed_cloud_base_ft_msl': '' if base_ft is None else round(base_ft),
+            'visibility_miles': '' if parse_num(r.get('vsby')) is None else parse_num(r.get('vsby')),
+            'source': 'IEM METAR (independent station observation)',
+        })
+    return results
+
+
+def download_iem(start, end, *, session=None):
+    """Start inclusive, end inclusive (dates); download query uses exclusive end."""
+    if start > end:
+        raise ValueError('start must precede end')
+    client = session or requests
+    output = []
+    cur = start
+    while cur <= end:
+        stop = min(end + timedelta(days=1), cur + timedelta(days=31))
+        params = [
+            ('station', OBS_STATION), ('network', OBS_NETWORK), ('data', 'all'),
+            ('year1', cur.year), ('month1', cur.month), ('day1', cur.day),
+            ('year2', stop.year), ('month2', stop.month), ('day2', stop.day),
+            ('tz', 'Etc/UTC'), ('format', 'onlycomma'),
+            ('latlon', 'no'), ('elev', 'no'), ('missing', 'M'),
+            ('trace', 'T'), ('direct', 'no'),
+            ('report_type', '3'), ('report_type', '4'),
+        ]
+        response = client.get(IEM_URL, params=params, timeout=120)
+        response.raise_for_status()
+        output.extend(parse_iem_csv(response.text))
+        cur = stop
+    return list({r['timestamp']: r for r in output}.values())
+
+
+def save_csv(records, dest):
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    names = ('timestamp', 'station', 'observed_fog', 'observed_low_ceiling', 'observed_cloud_base_ft_msl',
+             'visibility_miles', 'source')
+    with dest.open('w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=names)
+        writer.writeheader()
+        writer.writerows(records)
+
+
+def read_csv(path):
+    records = {}
+    with open(path, newline='') as f:
+        for r in csv.DictReader(f):
+            key = r['timestamp']
+            if key in records:
+                raise ValueError(f'Duplicate station observation hour: {key}')
+            label = (int(r['observed_fog']) if r.get('observed_fog', '') != '' else None)
+            low = (int(r['observed_low_ceiling']) if r.get('observed_low_ceiling', '') != '' else None)
+            if low not in (None, 0, 1):
+                raise ValueError(f'Invalid observed low ceiling label: {low}')
+            if label not in (None, 0, 1):
+                raise ValueError(f'Invalid observed fog label: {label}')
+            base = parse_num(r.get('observed_cloud_base_ft_msl'))
+            records[key] = {'fog': label, 'low_ceiling': low, 'cloud_base_ft': base}
+    return records
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--start', type=date.fromisoformat, required=True)
+    parser.add_argument('--end', type=date.fromisoformat, required=True)
+    parser.add_argument('--output', type=Path, default=DATA_DIR / 'observed_bdu.csv')
+    args = parser.parse_args()
+    records = download_iem(args.start, args.end)
+    save_csv(records, args.output)
+    counts = {k: sum(r['observed_fog'] == k for r in records) for k in (0, 1)}
+    lowpos = sum(r['observed_low_ceiling'] == 1 for r in records)
+    print(f'Saved {len(records)} unique reported hours: {counts[1]} fog, {counts[0]} clear; {lowpos} low-ceiling positives; '
+          f'{sum(r["observed_cloud_base_ft_msl"] != "" for r in records)} low cloud-base reports. '
+          f'Unlabeled hours remain unknown. File: {args.output}')
+
+
+if __name__ == '__main__':
+    main()
+</file>
+
+<file path="models/.gitkeep">
+
+</file>
+
+<file path="scripts/__init__.py">
+"""Project helper command-line scripts."""
+</file>
+
+<file path="scripts/data_status.py">
+"""Quick statistics for collected HRRR training samples and observed target balance."""
+import argparse
+from collections import Counter
+from inversion.hrrr import load_jsonl
+from inversion.observations import read_csv
+
+ap=argparse.ArgumentParser()
+ap.add_argument('--features',default='data/hrrr_samples.jsonl')
+ap.add_argument('--observations',default='data/observed_bdu_2018_2026.csv')
+a=ap.parse_args()
+rows=load_jsonl(a.features)
+obs=read_csv(a.observations)
+print('Downloaded forecast-run/lead rows:',len(rows))
+print('Forecast lead counts:',dict(sorted(Counter(int(r['lead_hours']) for r in rows).items())))
+for target in ('low_ceiling','fog'):
+    by_time={r['timestamp'] for r in rows if r['timestamp'] in obs and obs[r['timestamp']].get(target) is not None}
+    npos={t for t in by_time if obs[t][target]==1}
+    print(target,'usable independently observed hours:',len(by_time),'positive hours:',len(npos),
+          'positive calendar days:',len({t[:10] for t in npos}))
+print('Note: repeated forecasts verifying at the same time do NOT add independent events.')
+</file>
+
+<file path="environment.yml">
+name: inversion
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - pytorch
+  - py-xgboost
+  - llvm-openmp
+  - herbie-data
+  - python-eccodes
+  - requests
+  - fastapi
+  - uvicorn
+  - pytest
+  - httpx
+</file>
+
+<file path="requirements-dev.txt">
+-r requirements.txt
+pytest>=8,<10
+httpx>=0.27,<1
+</file>
+
+<file path="requirements-hrrr.txt">
+-r requirements.txt
+herbie-data>=2024.7
+eccodes>=1.7
+</file>
+
+<file path="inversion/config.py">
+"""HRRR model contract. Never reuse models trained on older GFS features."""
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]
+MODEL_DIR = ROOT / 'models'
+DATA_DIR = ROOT / 'data'
+TIMEZONE = 'America/Denver'
+MODEL_SOURCE = 'hrrr'
+MODEL_VERSION = 'hrrr-kbdu-low-ceiling-v4'
+MAX_LEAD_HOURS = 40  # Valid times 0 <= fxx <=39 from issue time
+PRESSURE_LEVELS = (800, 750, 700, 650, 600)
+PROFILE_CHANNELS = ('temperature_c', 'rh_pct', 'u_ms', 'v_ms')
+PROFILE_LEVELS = 25
+PROFILE_TOP_AGL_M = 2000
+LANDMARKS_FT = {'Boulder': 5400, 'First Flatiron': 7200, 'Green Mountain': 8100}
+OBS_STATION, OBS_NETWORK = 'BDU', 'CO_ASOS'
+OBS_STATION_ELEV_FT = 5288
+OBS_LAT, OBS_LON = 40.0394, -105.2250
+FEATURE_NAMES = (
+    'temperature_2m_c', 'dewpoint_depression_c', 'relative_humidity_2m',
+    'low_cloud_pct', 'mid_cloud_pct', 'high_cloud_pct',
+    'forecast_visibility_log_m', 'forecast_pbl_height_m',
+    'hrrr_forecast_cloud_base_msl_m', 'hrrr_forecast_cloud_top_msl_m',
+    'wind_u_10m_ms', 'wind_v_10m_ms',
+    't_delta_300m', 't_delta_750m', 'rh_300m', 'rh_750m',
+    'wind_u_300m_ms', 'wind_v_300m_ms',
+    'lead_hours', 'hour_sin', 'hour_cos', 'year_sin', 'year_cos',
+)
+SCENIC_FEATURE_NAMES = FEATURE_NAMES + ('target_elevation_ft',)
+</file>
+
+<file path="inversion/features.py">
+"""Deprecated GFS feature adapter. HRRR rows are created in `inversion.hrrr`."""
+def rows_from_data(*args, **kwargs):
+    raise RuntimeError('GFS feature conversion retired. Use inversion.hrrr.build_row.')
+</file>
+
 <file path="inversion/predict.py">
 """Safe post-processing inference: separate airport fog, cloud base and scenic events."""
 import json
@@ -658,7 +1082,7 @@ class Predictor:
                 'xgb_probability': round(float(x_p[i]), 4),
                 'cnn_probability': round(float(c_p[i]), 4),
                 'probability': round(float((x_p[i] + c_p[i]) / 2), 4),
-                'event': 'observed_airport_fog',
+                'event': self.manifest['target'],
                 'forecast_inversion_warming_signal': upward_warming,
                 'estimated_low_cloud_base_ft_msl': round(base) if base is not None else None,
                 'cloud_base_80pct_residual_interval_ft_msl': [
@@ -670,652 +1094,218 @@ class Predictor:
 </file>
 
 <file path="inversion/server.py">
-"""Local web inference server. Requires saved observation-trained artifacts."""
+"""Local HRRR forecast website. Live samples are collected separately with `hrrr live`."""
 from datetime import datetime, timezone
 from pathlib import Path
-import threading
-import time
+import json
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from .config import ROOT, MODEL_DIR, MAX_LEAD_HOURS
-from .features import rows_from_data, utcparse
-from .weather import latest_available_run
+
+from .config import ROOT, DATA_DIR, MODEL_DIR, MAX_LEAD_HOURS
+from .hrrr import load_jsonl
 from .predict import Predictor
 
-app = FastAPI(title='Boulder Short-Range Fog & Inversion Predictor', version='2.0.0')
-_lock = threading.RLock()
-_cache = {'at': 0.0, 'data': None, 'stamp': None}
-_loaded = {'stamp': None, 'predictor': None}
-
-
-def load_predictor():
-    path = MODEL_DIR / 'manifest.json'
-    if not path.exists():
-        raise HTTPException(503, 'Observation-trained model not found. Download METAR labels and train first; see README.')
-    with _lock:
-        stamp = path.stat().st_mtime_ns
-        if _loaded['stamp'] == stamp and _loaded['predictor'] is not None:
-            return _loaded['predictor']
-        try:
-            model = Predictor(MODEL_DIR)
-        except (ValueError, RuntimeError, FileNotFoundError, KeyError) as exc:
-            raise HTTPException(503, f'Cannot load trained models: {exc}') from exc
-        _loaded.update(stamp=stamp, predictor=model)
-        return model
-
+app = FastAPI(title='Boulder HRRR Low-Cloud Predictor', version='3.0.0')
 
 @app.get('/')
 def index():
-    return FileResponse(ROOT / 'index.html')
-
+    return FileResponse(ROOT/'index.html')
 
 @app.get('/{name}')
 def site_file(name: str):
-    if name not in ('guide.html', 'science.html', 'dashboard.js'):
-        raise HTTPException(404, 'Not found')
-    return FileResponse(ROOT / name)
-
+    if name not in ('guide.html','science.html','dashboard.js'):
+        raise HTTPException(404,'Not found')
+    return FileResponse(ROOT/name)
 
 @app.get('/api/health')
 def health():
-    return {'status': 'ok', 'trained_models_available': (MODEL_DIR / 'manifest.json').exists(),
-            'forecast_horizon_hours_exclusive': MAX_LEAD_HOURS}
-
+    return {'status':'ok', 'trained_models_available':(MODEL_DIR/'manifest.json').exists(),
+            'forecast_horizon_hours_exclusive':MAX_LEAD_HOURS,
+            'live_samples_available':(DATA_DIR/'hrrr_live.jsonl').exists()}
 
 @app.get('/api/forecast')
-def forecast(refresh: bool = False):
-    predictor = load_predictor()
-    with _lock:
-        stamp = _loaded['stamp']
-        if (not refresh and _cache['data'] is not None
-                and time.monotonic() - _cache['at'] < 1800
-                and _cache['stamp'] == stamp):
-            return _cache['data']
-    now = datetime.now(timezone.utc)
+def forecast(refresh: bool=False):
+    path=MODEL_DIR/'manifest.json'
+    if not path.exists():
+        raise HTTPException(503,'Train HRRR models first: python -m inversion.train --observations ...')
     try:
-        data = latest_available_run(now=now)
-        issue = utcparse(data['_run_utc'])
-        rows = [r for r in rows_from_data(data)
-                if now <= utcparse(r['timestamp']) and 0 <= r['lead_hours'] < MAX_LEAD_HOURS]
-    except (ValueError, RuntimeError) as exc:
-        raise HTTPException(502, f'Initialized GFS forecast acquisition failed: {exc}') from exc
-    if len(rows) < 8:
-        raise HTTPException(502, 'Less than 8 complete GFS hours available for this initialized run.')
-    result = {
-        'source': 'Open-Meteo GFS Single Runs (explicit 6-hour-cycle forecast issue time)',
-        'forecast_run_utc': issue.isoformat(),
-        'fetched_at_utc': now.isoformat(),
-        'model': {
-            'target': predictor.manifest['target'],
-            'verified_observations': predictor.manifest['verified_observations'],
-            'warning': predictor.manifest['disclaimer'],
-            'test_metrics': predictor.manifest['test_metrics'],
-            'cloud_base_available': predictor.manifest['cloud_base']['available'],
-            'scenic_available': predictor.manifest['scenic']['available'],
-            'max_lead_hours_exclusive': MAX_LEAD_HOURS,
+        predictor=Predictor(MODEL_DIR)
+    except (ValueError, RuntimeError, FileNotFoundError, KeyError) as exc:
+        raise HTTPException(503,f'Could not load HRRR model: {exc}') from exc
+    rows=load_jsonl(DATA_DIR/'hrrr_live.jsonl')
+    now=datetime.now(timezone.utc)
+    allowed=set(predictor.manifest['trained_lead_hours'])
+    rows=[r for r in rows if int(r['lead_hours']) in allowed
+          and datetime.fromisoformat(r['timestamp'].replace('Z','+00:00'))>now]
+    if not rows:
+        raise HTTPException(503,'No current HRRR samples at trained lead times. Run: python -m inversion.hrrr live --lead-hours 24,30,36')
+    issue_times={r['run_utc'] for r in rows}
+    if len(issue_times)!=1:
+        raise HTTPException(503,'Mixed HRRR issue times in live sample cache; re-run hrrr live')
+    for r in rows:
+        import numpy as np
+        r['features']=np.asarray(r['features'],dtype=np.float32)
+        r['profile']=np.asarray(r['profile'],dtype=np.float32)
+    result={
+        'source':'NOAA HRRR indexed GRIB2 point forecast near KBDU',
+        'forecast_run_utc':next(iter(issue_times)),
+        'fetched_at_utc':now.isoformat(),
+        'model':{
+            'target':predictor.manifest['target'],
+            'verified_observations':True,
+            'warning':predictor.manifest['disclaimer'],
+            'test_metrics':predictor.manifest['test_metrics'],
+            'cloud_base_available':predictor.manifest['cloud_base']['available'],
+            'scenic_available':False,
+            'max_lead_hours_exclusive':MAX_LEAD_HOURS,
         },
-        'hours': predictor.predict(rows),
+        'hours':predictor.predict(sorted(rows,key=lambda r:r['timestamp'])),
     }
-    with _lock:
-        _cache.update(at=time.monotonic(), data=result, stamp=stamp)
     return result
 </file>
 
 <file path="inversion/train.py">
-"""Train on issued GFS runs aligned to independent METAR station labels.
-
-Usage: python -m inversion.train --start 2026-05-01 --end 2026-10-01 \
- --observations data/observed_bdu.csv
-
-Optional manually verified landmark labels enable direct scenic-event model:
-  timestamp,target_elevation_ft,observed_summit_clear
-  2026-09-01T12:00:00Z,8100,1
-Do NOT infer summit-clear labels from airport cloud bases.
-"""
-import argparse
-import csv
-import json
-import math
-from datetime import date, datetime, time, timezone, timedelta
-from pathlib import Path
-
-import numpy as np
-import torch
-from sklearn.metrics import mean_absolute_error
-from xgboost import XGBRegressor
-
-from .config import (DATA_DIR, MODEL_DIR, FEATURE_NAMES, SCENIC_FEATURE_NAMES,
-                     PROFILE_CHANNELS, PROFILE_LEVELS, PROFILE_TOP_AGL_M,
-                     MODEL_VERSION, MODEL_SOURCE, MAX_LEAD_HOURS, ARCHIVE_START)
-from .features import rows_from_data
-from .weather import fetch_archive
-from .observations import read_csv
-from .models import (train_xgb, train_cnn, raw_cnn, platt_fit,
-                     platt_apply, metrics)
-
-
-def unique_rows(responses):
-    """Multiple forecast issuances predict the same future valid hour.
-
-    DO NOT deduplicate by valid timestamp: lead time is a model input.
-    """
-    unique = {}
-    for data in responses:
-        for r in rows_from_data(data):
-            unique[(r['timestamp'], r['run_utc'])] = r
-    return sorted(unique.values(), key=lambda x: (x['timestamp'], x['run_utc']))
-
-
-def split_chronological(pairs, *, gap_hours=MAX_LEAD_HOURS, minimum=150, binary=True):
-    """Order by valid time and purge a >=forecast-horizon gap from val/test.
-
-    This keeps different model runs verifying at the SAME hour in one partition.
-    If a user only supplies sparse observations, detect too little data rather
-    than silently permit leakage. Repeated outcomes within a split are allowed.
-    """
-    if len(pairs) < minimum:
-        raise ValueError(f'Need at least {minimum} usable labeled examples; got {len(pairs)}')
-    times = sorted({p[0]['timestamp'] for p in pairs})
-    if len(times) < 30:
-        raise ValueError('Need at least 30 different observed valid hours')
-    cutoff1 = times[int(len(times) * .70)]
-    cutoff2 = times[int(len(times) * .85)]
-    d1 = datetime.fromisoformat(cutoff1.replace('Z', '+00:00'))
-    d2 = datetime.fromisoformat(cutoff2.replace('Z', '+00:00'))
-    delta = timedelta(hours=gap_hours)
-    dt = lambda r: datetime.fromisoformat(r[0]['timestamp'].replace('Z', '+00:00'))
-    tr = [pair for pair in pairs if dt(pair) < d1 - delta]
-    va = [pair for pair in pairs if d1 <= dt(pair) < d2 - delta]
-    te = [pair for pair in pairs if dt(pair) >= d2]
-    if min(len(tr), len(va), len(te)) < 10:
-        raise ValueError('Not enough independent examples after 72-hour split purge')
-    if binary:
-        for name, split in [('train', tr), ('validation', va), ('test', te)]:
-            if len({int(y) for _, y in split}) < 2:
-                raise ValueError(f'{name} has only one class; collect a longer period/real events')
-    return tr, va, te
-
-
-def arrays(part):
-    return (
-        np.stack([r['features'] for r, _ in part]),
-        np.stack([r['profile'] for r, _ in part]),
-        np.asarray([y for _, y in part], dtype=np.int64),
-    )
-
-
-def summarize_split(trainset, valset, testset):
-    return {
-        'training_rows': len(trainset), 'validation_rows': len(valset),
-        'test_rows': len(testset),
-        'train_valid_time_span_utc': [trainset[0][0]['timestamp'], trainset[-1][0]['timestamp']],
-        'test_valid_time_span_utc': [testset[0][0]['timestamp'], testset[-1][0]['timestamp']],
-    }
-
-
-def read_summit_labels(path):
-    """Only human-verified observations; never fabricate summit visibility."""
-    result = []
-    with open(path, newline='') as f:
-        for raw in csv.DictReader(f):
-            d = datetime.fromisoformat(raw['timestamp'].replace('Z', '+00:00'))
-            if d.tzinfo is None:
-                raise ValueError('Summit timestamps must include UTC offset or Z')
-            key = d.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat().replace('+00:00', 'Z')
-            z = float(raw['target_elevation_ft'])
-            clear = int(raw['observed_summit_clear'])
-            if clear not in (0, 1) or not 5400 <= z <= 11000:
-                raise ValueError('Summit clear must be 0/1 and altitude 5400..11000 ft')
-            result.append((key, z, clear))
-    if len(set((t, z) for t, z, _ in result)) != len(result):
-        raise ValueError('Duplicate summit target hour/elevation')
-    return result
-
-
-def fit_cloud_base(rows, observations, directory, *, min_rows=100):
-    """Optional conditional cloud BASE regression, NOT a cloud TOP predictor."""
-    examples = [(r, observations[r['timestamp']]['cloud_base_ft'])
-                for r in rows if r['timestamp'] in observations
-                and observations[r['timestamp']]['cloud_base_ft'] is not None]
-    if len(examples) < min_rows:
-        return {'available': False, 'reason': f'Only {len(examples)} reported low cloud bases (minimum {min_rows}).'}
-    try:
-        tr, va, te = split_chronological(examples, minimum=min_rows, binary=False)
-    except ValueError as e:
-        return {'available': False, 'reason': str(e)}
-    xtr = np.stack([r['features'] for r, _ in tr])
-    xva = np.stack([r['features'] for r, _ in va])
-    xte = np.stack([r['features'] for r, _ in te])
-    ytr = np.asarray([v for _, v in tr], dtype=float)
-    yva = np.asarray([v for _, v in va], dtype=float)
-    yte = np.asarray([v for _, v in te], dtype=float)
-    reg = XGBRegressor(n_estimators=180, max_depth=3, learning_rate=.04,
-                       subsample=.85, colsample_bytree=.9, tree_method='hist',
-                       n_jobs=4, random_state=42, objective='reg:squarederror')
-    reg.fit(xtr, ytr, verbose=False)
-    residual = np.abs(reg.predict(xva) - yva)
-    # Marginal validation 80% absolute residual band, not a true conditional interval.
-    margin = float(np.quantile(residual, .8))
-    residual_sigma = max(50.0, float(np.std(reg.predict(xva) - yva)))
-    mae = float(mean_absolute_error(yte, reg.predict(xte)))
-    reg.save_model(str(directory / 'cloud_base.json'))
-    return {'available': True, 'target': 'METAR BKN/OVC/VV low cloud BASE ft MSL (not cloud top)',
-            'validation_80pct_abs_residual_ft': round(margin, 1),
-            'validation_residual_sigma_ft': round(residual_sigma, 1),
-            'test_mae_ft': round(mae, 1), 'split': summarize_split(tr, va, te),
-            'warning': 'Only predicts a reported cloud base near KBDU when a low ceiling is reported; cannot infer summit clearance.'}
-
-
-def fit_scenic(rows, observations, labels, directory, *, min_rows=150):
-    """Optional elevation-conditioned classifier for independently labeled scenic event."""
-    if not labels:
-        return {'available': False, 'reason': 'No independently observed summit-clear labels supplied.'}
-    weather_by_valid = {}
-    for row in rows:
-        weather_by_valid.setdefault(row['timestamp'], []).append(row)
-    samples = []
-    for timestamp, elevation, summit_clear in labels:
-        station = observations.get(timestamp)
-        if not station or station['fog'] is None:
-            continue  # Cannot infer a negative from unknown fog.
-        target = int(station['fog'] == 1 and summit_clear == 1)
-        for row in weather_by_valid.get(timestamp, []):
-            newrow = {**row, 'scenic_features': np.append(row['features'], elevation).astype(np.float32)}
-            samples.append((newrow, target))
-    if len(samples) < min_rows:
-        return {'available': False, 'reason': f'Only {len(samples)} independently labeled scenic examples (minimum {min_rows}).'}
-    try:
-        tr, va, te = split_chronological(samples, minimum=min_rows)
-    except ValueError as e:
-        return {'available': False, 'reason': str(e)}
-    xa = lambda part: np.stack([r['scenic_features'] for r, _ in part])
-    ya = lambda part: np.asarray([y for _, y in part])
-    model = train_xgb(xa(tr), ya(tr), xa(va), ya(va))
-    cal = platt_fit(model.predict_proba(xa(va))[:, 1], ya(va))
-    report = metrics(ya(te), platt_apply(model.predict_proba(xa(te))[:, 1], cal))
-    model.save_model(str(directory / 'scenic.json'))
-    # Only publish altitudes with at least 30 independent annotated valid times.
-    unique_per_alt = {float(z): {t for t, z0, _ in labels if z0 == z} for _, z, _ in labels}
-    trained_elevations = sorted(z for z, times in unique_per_alt.items() if len(times) >= 30)
-    return {'available': True, 'trained_elevations_ft': trained_elevations,
-            'target': 'Observed Boulder fog AND independently observed summit clear',
-            'features': list(SCENIC_FEATURE_NAMES), 'calibration': cal,
-            'test_metrics': report, 'split': summarize_split(tr, va, te),
-            'warning': 'Summit-clear observations must be independently audited; altitude interpolation is not validated.'}
-
-
-def train(responses, *, observations, scenic_labels=None, model_dir=MODEL_DIR,
-          cnn_epochs=25, xgb_estimators=300, min_rows=150):
-    """Fail closed: independent labels required. No synthetic/proxy training mode."""
-    if not observations:
-        raise ValueError('Independent METAR observations are required')
-    rows = unique_rows(responses)
-    if not rows:
-        raise ValueError('No usable GFS profiles with valid issue times and 0-72h leads')
-    labeled = [(r, observations[r['timestamp']]['fog']) for r in rows
-               if r['timestamp'] in observations and observations[r['timestamp']]['fog'] is not None]
-    tr, va, te = split_chronological(labeled, minimum=min_rows)
-    xtr, ptr, ytr = arrays(tr)
-    xva, pva, yva = arrays(va)
-    xte, pte, yte = arrays(te)
-    xgb = train_xgb(xtr, ytr, xva, yva, estimators=xgb_estimators)
-    cnn, mean, scale, cnn_info = train_cnn(ptr, ytr, pva, yva, epochs=cnn_epochs)
-    xgb_cal = platt_fit(xgb.predict_proba(xva)[:, 1], yva)
-    cnn_cal = platt_fit(raw_cnn(cnn, pva, mean, scale), yva)
-    xprobs = platt_apply(xgb.predict_proba(xte)[:, 1], xgb_cal)
-    cprobs = platt_apply(raw_cnn(cnn, pte, mean, scale), cnn_cal)
-    ensemble = (xprobs + cprobs) / 2
-    report = {'xgb': metrics(yte, xprobs), 'cnn': metrics(yte, cprobs),
-              'ensemble': metrics(yte, ensemble)}
-    by_lead = {}
-    for lo, hi in ((0, 24), (24, 48), (48, 72)):
-        mask = np.asarray([lo <= r['lead_hours'] < hi for r, _ in te], dtype=bool)
-        if mask.any():
-            by_lead[f'{lo}-{hi}h'] = {'n': int(mask.sum()), **metrics(yte[mask], ensemble[mask])}
-    # A simple forecast-only categorical baseline (not itself calibrated).
-    raw_forecast_flags = np.asarray([
-        int(r['observables']['forecast_visibility_m'] <= 1609) for r, _ in te
-    ], dtype=np.float32)
-    report['raw_gfs_visibility_threshold'] = metrics(yte, raw_forecast_flags)
-    model_dir = Path(model_dir)
-    model_dir.mkdir(parents=True, exist_ok=True)
-    xgb.save_model(str(model_dir / 'xgb.json'))
-    torch.save({'state_dict': cnn.state_dict(),
-                'mean': torch.tensor(mean), 'scale': torch.tensor(scale)},
-               str(model_dir / 'cnn.pt'))
-    base_meta = fit_cloud_base(rows, observations, model_dir, min_rows=100)
-    scenic_meta = fit_scenic(rows, observations, scenic_labels, model_dir, min_rows=min_rows)
-    # Remove stale optional models when retraining cannot support them.
-    for ok, name in [(base_meta['available'], 'cloud_base.json'),
-                     (scenic_meta['available'], 'scenic.json')]:
-        if not ok:
-            (model_dir / name).unlink(missing_ok=True)
-    manifest = {
-        'version': MODEL_VERSION, 'data_model': MODEL_SOURCE,
-        'target': 'observed_airport_fog', 'verified_observations': True,
-        'observation_station': 'KBDU / Boulder Municipal Airport',
-        'max_lead_hours_exclusive': MAX_LEAD_HOURS,
-        'weather_archive': 'Open-Meteo GFS Single Runs (issue-time preserving)',
-        'disclaimer': ('METAR-based fog predictions at Boulder Municipal Airport; not thermodynamic '
-                       'inversion measurements or proven mountain cloud-sea probabilities. '
-                       'Historical forecast availability and independent event frequency limit accuracy.'),
-        'features': list(FEATURE_NAMES), 'channels': list(PROFILE_CHANNELS),
-        'profile_levels': PROFILE_LEVELS, 'profile_top_agl_m': PROFILE_TOP_AGL_M,
-        **summarize_split(tr, va, te),
-        'test_metrics': report, 'test_metrics_by_lead': by_lead,
-        'calibration': {'xgb': xgb_cal, 'cnn': cnn_cal},
-        'cnn_training': cnn_info, 'cloud_base': base_meta, 'scenic': scenic_meta,
-    }
-    (model_dir / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-    return manifest
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--start', type=date.fromisoformat, required=True,
-                        help='First historical GFS run UTC date (>=2026-04-02)')
-    parser.add_argument('--end', type=date.fromisoformat, required=True,
-                        help='Last historical GFS run UTC date (no future dates)')
-    parser.add_argument('--observations', type=Path, required=True,
-                        help='CSV generated with python -m inversion.observations')
-    parser.add_argument('--summit-labels', type=Path,
-                        help='Optional human-labeled summit_clear CSV with elevation')
-    parser.add_argument('--run-every-hours', type=int, choices=[6, 12, 24], default=24)
-    parser.add_argument('--history-json', type=Path, help='Offline run-shaped JSON fixtures')
-    parser.add_argument('--epochs', type=int, default=25)
-    parser.add_argument('--model-dir', type=Path, default=MODEL_DIR)
-    args = parser.parse_args()
-    if args.history_json:
-        responses = json.loads(args.history_json.read_text())
-        responses = responses if isinstance(responses, list) else [responses]
-    else:
-        start = datetime.combine(args.start, time(0), timezone.utc)
-        end = datetime.combine(args.end, time(0), timezone.utc)
-        if start < datetime.fromisoformat(ARCHIVE_START).replace(tzinfo=timezone.utc):
-            parser.error(f'GFS single run archive begins {ARCHIVE_START} UTC')
-        if end > datetime.now(timezone.utc) - timedelta(days=3):
-            parser.error('Training runs must be at least 3 days old to have completed verification observations')
-        responses = fetch_archive(start, end, run_every_hours=args.run_every_hours,
-                                  cache_dir=DATA_DIR / 'gfs_runs')
-    result = train(responses, observations=read_csv(args.observations),
-                   scenic_labels=read_summit_labels(args.summit_labels) if args.summit_labels else None,
-                   model_dir=args.model_dir, cnn_epochs=args.epochs)
-    print(json.dumps(result, indent=2))
-
+"""HRRR training entry point. Legacy GFS v2 training is no longer compatible."""
+from .hrrr_train import main
 
 if __name__ == '__main__':
     main()
 </file>
 
 <file path="inversion/weather.py">
-"""Issue-time-preserving GFS forecast collection. Never train from stitched hindsight."""
-import json
-import time
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+"""Deprecated GFS downloader kept for import compatibility.
 
-import requests
-from .config import (BOULDER_LAT, BOULDER_LON, HOURLY_FIELDS,
-                     MODEL_SOURCE, MAX_LEAD_HOURS, ARCHIVE_START)
+HRRR version 3 uses `python -m inversion.hrrr` instead.
+"""
+def fetch_archive(*args, **kwargs):
+    raise RuntimeError('GFS downloader retired. Use python -m inversion.hrrr collect.')
 
-RUN_URL = 'https://single-runs-api.open-meteo.com/v1/forecast'
-
-
-def utc(dt):
-    if dt.tzinfo is None:
-        raise ValueError('Run initialization requires an explicit timezone')
-    return dt.astimezone(timezone.utc)
-
-
-def run_params(initialization):
-    init = utc(initialization)
-    return {
-        'latitude': BOULDER_LAT, 'longitude': BOULDER_LON,
-        'models': MODEL_SOURCE, 'hourly': ','.join(HOURLY_FIELDS),
-        'timezone': 'UTC', 'temperature_unit': 'celsius',
-        'wind_speed_unit': 'kmh', 'forecast_hours': MAX_LEAD_HOURS,
-        'run': init.strftime('%Y-%m-%dT%H:%M'),
-    }
-
-
-def fetch_run(initialization, *, session=None, cache_dir=None):
-    """Fetch an immutable, uniquely initialized run and cache raw JSON."""
-    init = utc(initialization)
-    if init < datetime.fromisoformat(ARCHIVE_START).replace(tzinfo=timezone.utc):
-        raise ValueError(f'GFS single-run archive does not reach {init.isoformat()}; starts {ARCHIVE_START} UTC')
-    cache_path = None
-    if cache_dir is not None:
-        cache = Path(cache_dir)
-        cache.mkdir(parents=True, exist_ok=True)
-        cache_path = cache / f'gfs_global_{init:%Y%m%dT%H%MZ}_v2.json'
-        if cache_path.exists():
-            data = json.loads(cache_path.read_text())
-            if data.get('_run_utc') != init.isoformat():
-                raise ValueError('Cached run has incorrect initialization')
-            return data
-    client = session if session is not None else requests
-    last_error = None
-    for attempt in range(3):
-        try:
-            response = client.get(RUN_URL, params=run_params(init), timeout=70)
-            response.raise_for_status()
-            data = response.json()
-            if not isinstance(data.get('hourly'), dict) or not data['hourly'].get('time'):
-                raise ValueError(f'No hourly data in GFS run: {str(data)[:180]}')
-            data['_run_utc'] = init.isoformat()
-            data['_forecast_model'] = MODEL_SOURCE
-            if cache_path:
-                cache_path.write_text(json.dumps(data))
-            return data
-        except (requests.RequestException, ValueError) as exc:
-            last_error = exc
-            if attempt < 2:
-                time.sleep(attempt + 1)
-    raise RuntimeError(f'Cannot fetch GFS run {init.isoformat()}: {last_error}') from last_error
-
-
-def run_times(start, end, *, run_every_hours=24):
-    """Inclusive UTC run initialization range, e.g. 00Z daily or 00/12Z."""
-    if run_every_hours not in (6, 12, 24):
-        raise ValueError('run_every_hours must be 6, 12 or 24, aligned to 00Z')
-    start, end = utc(start), utc(end)
-    cursor = start.replace(hour=0, minute=0, second=0, microsecond=0)
-    while cursor <= end:
-        if cursor >= start:
-            yield cursor
-        cursor += timedelta(hours=run_every_hours)
-
-
-def fetch_archive(start, end, *, run_every_hours=24, cache_dir=None, session=None):
-    return [fetch_run(r, cache_dir=cache_dir, session=session)
-            for r in run_times(start, end, run_every_hours=run_every_hours)]
-
-
-def latest_available_run(*, now=None, session=None, cache_dir=None):
-    """Try completed 6-hourly GFS runs; assume at least 7h dissemination lag.
-
-    There is NO fallback to stitched forecasts: serving with different lead-time
-    semantics would silently invalidate the model. API errors propagate.
-    """
-    now = utc(now or datetime.now(timezone.utc))
-    candidate = (now - timedelta(hours=7)).replace(minute=0, second=0, microsecond=0)
-    candidate = candidate.replace(hour=(candidate.hour // 6) * 6)
-    errors = []
-    for k in range(5):
-        init = candidate - timedelta(hours=6 * k)
-        try:
-            return fetch_run(init, session=session, cache_dir=cache_dir)
-        except (ValueError, RuntimeError) as exc:
-            errors.append(str(exc))
-    raise RuntimeError('No recent initialized GFS run available. ' + '; '.join(errors[-2:]))
-</file>
-
-<file path="models/.gitkeep">
-
+def latest_available_run(*args, **kwargs):
+    raise RuntimeError('GFS downloader retired. Use python -m inversion.hrrr live.')
 </file>
 
 <file path="tests/test_pipeline.py">
-"""Offline reproducible contract tests; artificial observations are TEST FIXTURES."""
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-import math
-import json
-
+"""Offline HRRR feature/model tests. These are synthetic fixtures, not real weather."""
+from datetime import datetime,timedelta,timezone,date
 import numpy as np
+from pathlib import Path
+import json
 import pytest
-from fastapi.testclient import TestClient
-
-from inversion.config import HOURLY_FIELDS, PRESSURE_LEVELS, FEATURE_NAMES, MAX_LEAD_HOURS
-from inversion.features import row_at, rows_from_data, uv
-from inversion.observations import (parse_iem_csv, classify_report, observed_cloud_base_ft,
-                                    save_csv, read_csv)
-from inversion.weather import run_params, run_times
-from inversion.train import train, unique_rows, split_chronological
+import re
+from inversion.hrrr import build_row,historical_pairs,load_jsonl,write_jsonl,PRESSURE_REGEX
+from inversion.config import FEATURE_NAMES, PROFILE_CHANNELS,MAX_LEAD_HOURS
+from inversion.observations import classify_low_ceiling, parse_iem_csv, save_csv, read_csv
+from inversion.hrrr_train import run_training, rows_and_labels, positive_days
 from inversion.predict import Predictor
-from inversion.server import app
 
 
-def fake_run(issue, *, n=72):
-    h = {'time': [(issue + timedelta(hours=i)).strftime('%Y-%m-%dT%H:%M') for i in range(n)]}
-    for key in HOURLY_FIELDS:
-        h[key] = []
-    for i in range(n):
-        timestamp = issue + timedelta(hours=i)
-        fog = (timestamp.date().toordinal() % 5 == 0 and 3 <= timestamp.hour <= 17)
-        surf = 6 + 7 * math.sin(i / 36)
-        vals = {
-            'temperature_2m': surf,
-            'dew_point_2m': surf - (.6 if fog else 5),
-            'relative_humidity_2m': 96 if fog else 58,
-            'cloud_cover_low': 92 if fog else 17,
-            'cloud_cover_mid': 10 if fog else 55,
-            'cloud_cover_high': 12 if fog else 60,
-            'visibility': 650 if fog else 18000,
-            'boundary_layer_height': 140 if fog else 1250,
-            'weather_code': 45 if fog else 1,
-            'wind_speed_10m': 5 if fog else 20,
-            'wind_direction_10m': 80 if fog else 270,
-        }
-        for p, height in zip(PRESSURE_LEVELS, [1950, 2420, 3000, 3500, 4200]):
-            vals.update({
-                f'temperature_{p}hPa': surf + (2 if fog else -2) - (height - 1950) * .004,
-                f'relative_humidity_{p}hPa': 86 if fog else 45,
-                f'cloud_cover_{p}hPa': 90 if fog and p >= 750 else 14,
-                f'wind_speed_{p}hPa': 12,
-                f'wind_direction_{p}hPa': 85,
-                f'geopotential_height_{p}hPa': height,
-            })
-        for key in HOURLY_FIELDS:
-            h[key].append(vals[key])
-    return {'elevation':1640,'hourly':h,'_run_utc':issue.isoformat(),
-            '_forecast_model':'gfs_global'}
+def hrrr_scalars(fog=False):
+    s = {('HGT','surface'): 1650.0,('TMP','2 m above ground'):280.0,
+         ('DPT','2 m above ground'): 279.5 if fog else 272.0,
+         ('RH','2 m above ground'): 98.0 if fog else 50.0,
+         ('UGRD','10 m above ground'): 2.0, ('VGRD','10 m above ground'):-3.0,
+         ('VIS','surface'): 200.0 if fog else 16000.0,
+         ('LCDC','low cloud layer'):95.0 if fog else 12.0,
+         ('MCDC','middle cloud layer'):20.0,('HCDC','high cloud layer'):18.0,
+         ('HPBL','surface'): 100.0 if fog else 1000.0,
+         ('HGT','cloud base'): 1900.0 if fog else 2900.0,
+         ('HGT','cloud top'): 2300.0 if fog else 3600.0}
+    p = {}
+    for pressure,z in zip([800,750,700,650,600],[1950,2420,3000,3550,4250]):
+        k=f'{pressure} mb'
+        p.update({('HGT',k):z,('TMP',k):282.0-(z-1950)*.004 if fog else 275-(z-1950)*.004,
+                  ('RH',k):90.0 if fog else 50.0,
+                  ('UGRD',k):3.0,('VGRD',k):-2.0})
+    return s,p
 
 
-def fixture_data(days=80):
-    initial = datetime(2026,5,1,tzinfo=timezone.utc)
-    runs = [fake_run(initial + timedelta(days=d)) for d in range(days)]
-    observations = {}
-    for d in range(days+3):
-        for hour in range(24):
-            at = initial + timedelta(days=d,hours=hour)
-            label = int(at.date().toordinal() % 5 == 0 and 3 <= at.hour <= 17)
-            key = at.isoformat().replace('+00:00','Z')
-            observations[key] = {'fog':label,
-                                 'cloud_base_ft': (5900 + d * 4) if hour in (2, 8, 14, 20) else None}
-    return runs, observations
+def test_features_and_older_forecast_horizon(tmp_path):
+    i=datetime(2025,1,1,tzinfo=timezone.utc)
+    s,p=hrrr_scalars(True)
+    assert not any(k[0] == 'CLWMR' for k in p)
+    assert re.search(PRESSURE_REGEX, ':HGT:800 mb:anl:')
+    assert not re.search(PRESSURE_REGEX, ':CLWMR:800 mb:anl:')
+    r=build_row(i,36,s,p)
+    assert r['features'] and len(r['features'])==len(FEATURE_NAMES)
+    assert np.asarray(r['profile']).shape==(len(PROFILE_CHANNELS),25)
+    assert r['lead_hours']==36 and r['observables']['lowClouds']==95
+    assert 5000 < r['observables']['forecast_cloud_base_ft_msl'] < 7000
+    write_jsonl(tmp_path/'rows.jsonl',[r])
+    assert load_jsonl(tmp_path/'rows.jsonl')[0]['timestamp']==r['timestamp']
+    a=list(historical_pairs(date(2019,1,1),date(2019,1,2),0,[24,36,39]))
+    assert len(a)==4 and max(f for _,f in a)==36
+    b=list(historical_pairs(date(2025,1,1),date(2025,1,1),0,[24,36,39]))
+    assert len(b)==3
 
 
-def test_issue_time_schema_and_no_peeking():
-    init=datetime(2026,5,1,tzinfo=timezone.utc)
-    data=fake_run(init,n=76)
-    assert run_params(init)['run']=='2026-05-01T00:00'
-    assert len(rows_from_data(data))==72
-    r=rows_from_data(data)[1]
-    assert r['features'].shape == (len(FEATURE_NAMES),)
-    assert r['profile'].shape == (5,25)
-    assert r['lead_hours']==1
-    assert row_at(data,72) is None
-    data['hourly']['cloud_cover_800hPa'][1] = None
-    assert row_at(data,1) is None
-    assert abs(uv(36,90)[0]+10)<1e-6
-    # Optional GFS boundary-layer-height missing: keep row with explicit NaN.
-    data['hourly']['boundary_layer_height'][2] = None
-    assert np.isnan(row_at(data,2)['features'][7])
-    assert len(list(run_times(init,init+timedelta(days=2))))==3
-    with pytest.raises(ValueError):
-        list(run_times(init,init,run_every_hours=3))
+def test_low_ceiling_independent_of_visibility():
+    assert classify_low_ceiling({'skyc1':'OVC','skyl1':'400','vsby':'10'})==1
+    assert classify_low_ceiling({'skyc1':'CLR','vsby':'1'})==0
+    assert classify_low_ceiling({'vsby':'10'}) is None
+    raw='station,valid,vsby,skyc1,skyl1,wxcodes\nBDU,2026-06-01 12:06,10.0,OVC,400,\n'
+    r=parse_iem_csv(raw)[0]
+    assert r['observed_low_ceiling']==1 and r['observed_fog']==0
 
 
-def test_metar_records_not_model_labels(tmp_path):
-    csv_text='''# station data\nstation,valid,vsby,skyc1,skyl1,wxcodes\nBDU,2026-06-01 12:06,0.5,OVC,400,FG\nBDU,2026-06-01 13:05,10.0,CLR,M,\nBDU,2026-06-01 14:02,M,BKN,200,\nBDU,2026-06-01 15:01,2.0,CLR,M,\n'''
-    values=parse_iem_csv(csv_text)
-    assert len(values)==4
-    assert [v['observed_fog'] for v in values]==[1,0,'','']
-    assert values[0]['observed_cloud_base_ft_msl']==5688
-    assert observed_cloud_base_ft({'skyc1':'OVC','skyl1':'200'})==5488
-    output=tmp_path/'stations.csv'
-    save_csv(values,output)
-    read=read_csv(output)
-    assert read['2026-06-01T12:00:00Z']['fog']==1
-    assert read['2026-06-01T14:00:00Z']['fog'] is None
+def generate_fixture(days=160):
+    begin=datetime(2025,1,1,tzinfo=timezone.utc)
+    rows=[]; labels={}
+    for d in range(days):
+        init=begin+timedelta(days=d)
+        positive=(d%4==0)
+        s,p=hrrr_scalars(positive)
+        for lead in [24,30,36]:
+            row=build_row(init,lead,s,p)
+            rows.append(row)
+            labels[row['timestamp']]={'fog':int(positive),'low_ceiling':int(positive),
+                                      'cloud_base_ft':5900.0 + d*2}
+    return rows,labels
 
 
-def test_observations_required_no_proxy():
-    runs, labels = fixture_data(days=3)
-    with pytest.raises(ValueError,match='observations'):
-        train(runs,observations=None)
-    rows=unique_rows(runs)
-    assert len({r['timestamp'] for r in rows}) < len(rows)
+def test_train_save_and_predict(tmp_path):
+    rows,obs=generate_fixture()
+    m=run_training(rows,obs,tmp_path,epochs=1,estimators=20)
+    assert m['target']=='observed_airport_low_ceiling'
+    assert m['dataset']['positive_days']>3
+    assert m['cloud_base']['available']
+    results=Predictor(tmp_path).predict([
+        {**r,'features':np.asarray(r['features'],dtype=np.float32),
+         'profile':np.asarray(r['profile'],dtype=np.float32)} for r in rows[-3:]])
+    assert len(results)==3
+    assert all(r['cloud_top_ft'] is None for r in results)
+    assert all(0<=r['probability']<=1 for r in results)
 
 
-def test_train_save_predict_and_elevation_targets(tmp_path):
-    runs, obs=fixture_data()
-    # Supply independently-annotated summit clarity, only as synthetic test data.
-    summit=[]
-    for valid, val in obs.items():
-        if valid.endswith('T08:00:00Z') or valid.endswith('T14:00:00Z'):
-            summit.append((valid,8100, int(val['fog']==1)))
-    manifest=train(runs, observations=obs, scenic_labels=summit, model_dir=tmp_path,
-                   cnn_epochs=2, xgb_estimators=25)
-    assert manifest['verified_observations'] is True
-    assert manifest['target']=='observed_airport_fog'
-    assert manifest['cloud_base']['available']
-    assert manifest['scenic']['available']
-    assert {'manifest.json','xgb.json','cnn.pt','cloud_base.json','scenic.json'} <= {x.name for x in tmp_path.iterdir()}
-    results=Predictor(tmp_path).predict(rows_from_data(runs[-1])[:5])
-    assert len(results)==5
-    assert all(0 <= r['probability'] <= 1 for r in results)
-    assert results[0]['cloud_top_ft'] is None
-    assert results[0]['estimated_low_cloud_base_ft_msl'] is not None
-    assert results[0]['landmarks'][-1]['scenic_probability'] is not None
-    assert all(0 <= r['lead_hours'] < 72 for r in results)
+def test_positive_episode_guard(tmp_path):
+    rows,obs=generate_fixture(160)
+    for r in rows:
+        if r['timestamp'][:4]=='2025' and r['timestamp'][5:7] in ('05','06'):
+            obs[r['timestamp']]['low_ceiling']=0
+    with pytest.raises(ValueError,match='positive calendar days'):
+        run_training(rows,obs,tmp_path,epochs=1,estimators=20)
 
 
-def test_api_without_models_and_offline_with_models(tmp_path,monkeypatch):
+def test_local_api_using_offline_live_cache(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
     from inversion import server
+    rows, obs = generate_fixture()
+    run_training(rows, obs, tmp_path, epochs=1, estimators=20)
+    now = datetime.now(timezone.utc)
+    issue = now.replace(hour=(now.hour//6)*6, minute=0, second=0, microsecond=0)-timedelta(hours=6)
+    s,p = hrrr_scalars(True)
+    live = [build_row(issue, lead, s, p) for lead in (24, 30, 36)]
+    write_jsonl(tmp_path/'hrrr_live.jsonl', live, mode='w')
+    monkeypatch.setattr(server,'DATA_DIR',tmp_path)
     monkeypatch.setattr(server,'MODEL_DIR',tmp_path)
-    server._loaded.update(stamp=None,predictor=None)
-    server._cache.update(at=0.0,data=None,stamp=None)
-    client=TestClient(app)
-    assert client.get('/').status_code == 200
-    assert client.get('/dashboard.js').status_code == 200
-    assert client.get('/api/health').json()['trained_models_available'] is False
-    assert client.get('/api/forecast').status_code == 503
-    runs,obs=fixture_data()
-    train(runs, observations=obs, model_dir=tmp_path, cnn_epochs=1,xgb_estimators=20)
-    now=datetime.now(timezone.utc)
-    issue=(now-timedelta(hours=10)).replace(minute=0,second=0,microsecond=0)
-    live=fake_run(issue)
-    monkeypatch.setattr(server,'latest_available_run',lambda **kw: live)
-    result=client.get('/api/forecast')
-    assert result.status_code==200,result.text
-    payload=result.json()
-    assert payload['model']['scenic_available'] is False
-    assert all(h['landmarks'][1]['scenic_probability'] is None for h in payload['hours'])
-    assert len(payload['hours']) > 40
-    assert all(0 <= h['lead_hours'] < 72 for h in payload['hours'])
-    assert client.get('/api/forecast').json()==payload
+    client=TestClient(server.app)
+    assert client.get('/api/health').json()['trained_models_available'] is True
+    res=client.get('/api/forecast')
+    assert res.status_code == 200, res.text
+    body=res.json()
+    assert body['model']['target']=='observed_airport_low_ceiling'
+    assert all(r['cloud_top_ft'] is None for r in body['hours'])
+    assert all(0 <= r['probability'] <=1 for r in body['hours'])
 </file>
 
 <file path="dashboard.js">
@@ -1375,7 +1365,7 @@ def test_api_without_models_and_offline_with_models(tmp_path,monkeypatch):
         state.selectedDayIdx = Math.min(1, state.daysData.length - 1);
         state.selectedHourIdx = state.daysData[state.selectedDayIdx].peakHour;
         document.getElementById('apiStatusText').textContent = payload.model.verified_observations
-          ? 'KBDU observed-fog ML (experimental)' : 'Unverified model';
+          ? 'KBDU low-ceiling ML (experimental)' : 'Unverified model';
         document.getElementById('statusBadge').classList.remove('hidden');
         document.getElementById('modelCaveat').textContent = payload.model.warning;
         setActivePresetBtn('live');
@@ -1517,7 +1507,7 @@ def test_api_without_models_and_offline_with_models(tmp_path,monkeypatch):
         badge.className = 'text-[10px] font-bold uppercase tracking-wide text-amber-400 mt-1 px-2 py-1 bg-slate-900 rounded border border-amber-900';
         badge.textContent = label;
         verdictTitle.textContent = `XGBoost ${h.xgbScore}% · CNN ${h.cnnScore}%`;
-        verdictDesc.textContent = `Predicted METAR fog at Boulder Municipal Airport, ${h.lead_hours.toFixed(0)}h lead. GFS vertical warming signal: ${h.forecast_inversion_warming_signal ? 'present' : 'not detected'}. Neither proves a thermal inversion or summit visibility.`;
+        verdictDesc.textContent = `Predicted ${h.event === 'observed_airport_low_ceiling' ? 'low-cloud ceiling' : 'fog'} at Boulder Municipal Airport, ${h.lead_hours.toFixed(0)}h lead. HRRR vertical warming signal: ${h.forecast_inversion_warming_signal ? 'present' : 'not detected'}. Neither proves a thermal inversion or summit visibility.`;
         verdictIcon.className = 'fa-solid fa-chart-line text-cyan-400';
         verdictContainer.className = 'p-2.5 rounded-xl bg-cyan-950 text-cyan-400 text-lg flex-shrink-0';
         return;
@@ -1986,10 +1976,34 @@ def test_api_without_models_and_offline_with_models(tmp_path,monkeypatch):
     }
 </file>
 
-<file path="requirements-dev.txt">
--r requirements.txt
-pytest>=8,<10
-httpx>=0.27,<1
+<file path="dl_inversion.py">
+"""Compatibility entry point; implementation lives in inversion.models/train."""
+from inversion.models import ProfileCNN, train_cnn
+from inversion.train import main
+
+if __name__ == '__main__':
+    main()
+</file>
+
+<file path="requirements.txt">
+# CPU-only training and locally hosted inference (no paid cloud service).
+numpy>=1.26,<3
+scikit-learn>=1.4,<2
+xgboost>=2.0,<4
+torch>=2.2,<3
+requests>=2.31,<3
+fastapi>=0.110,<1
+uvicorn>=0.29,<1
+# Tests: pip install -r requirements-dev.txt
+</file>
+
+<file path="xgb_inversion.py">
+"""Compatibility entry point; implementation lives in inversion.models/train."""
+from inversion.models import train_xgb
+from inversion.train import main
+
+if __name__ == '__main__':
+    main()
 </file>
 
 <file path=".gitignore">
@@ -2023,19 +2037,20 @@ __pycache__/
 data/raw/
 data/gfs_runs/
 data/*.csv
-</file>
 
-<file path="dl_inversion.py">
-"""Compatibility entry point; implementation lives in inversion.models/train."""
-from inversion.models import ProfileCNN, train_cnn
-from inversion.train import main
 
-if __name__ == '__main__':
-    main()
+# HRRR raw subsets, local compact training cache and live sample cache
+/data/hrrr_tmp/
+/data/hrrr_samples.jsonl
+/data/hrrr_live.jsonl
+/data/*.jsonl
+/models/*.json
+/models/*.pt
+/models/cloud_base_report.json
 </file>
 
 <file path="guide.html">
-<!DOCTYPE html><html lang="en" class="dark"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Guide | Boulder Inversion Tracker</title><script src="https://cdn.tailwindcss.com"></script><style>body{background:#060911;color:#e2e8f0;font-family:system-ui,sans-serif}.card{background:#0f172a;border:1px solid #334155;border-radius:20px;padding:28px}a{color:#67e8f9}</style></head><body><header class="border-b border-slate-700 p-5"><nav class="max-w-4xl mx-auto flex justify-between"><strong>Boulder Inversion Tracker — Guide</strong><div class="space-x-5"><a href="/">Dashboard</a><a href="/science.html">Science</a></div></nav></header><main class="max-w-4xl mx-auto p-6 space-y-6"><section class="card space-y-2"><h1 class="text-2xl font-bold">Understanding the short-range tracker</h1><p>The live dashboard shows estimates for airport fog conditions from an initialized GFS run. Forecast lead times are strictly less than 72 hours from model initialization. Because model results are not distributed instantaneously, the remaining future window may be shorter than three days.</p><p>Forecast probabilities are experimental and only valid to the extent independently observed verification supports them. The first model uses reports from Boulder Municipal Airport (KBDU), not photos from the Flatirons.</p></section><section class="card space-y-2"><h2 class="text-xl font-bold">Reading the probability and charts</h2><p>The large percentage is the average of an XGBoost model and a small CNN estimating a conservatively defined reported airport fog event. The models receive numerical weather predictions of surface humidity, visibility, cloud cover, winds and vertical structure. Click a day or an hourly bar to inspect a specific forecast valid time. The other chart mode shows predicted low-cloud coverage, not a measured cloud-top height.</p></section><section class="card space-y-2"><h2 class="text-xl font-bold">Elevation-specific outlook</h2><p>Each landmark is shown at its target elevation. If sufficient independently observed summit conditions were provided during training, an elevation-conditioned scenic-event model returns an estimate. Otherwise it says <strong>Not trained</strong>. If enough reported low cloud bases exist, a separate regression model estimates the airport low-cloud <strong>base</strong> altitude, not the cloud-top or safe breakout elevation.</p><p>Do not use airport fog probability as a guarantee that Boulder is covered while Green Mountain is sunny. The diagram is schematic and does not indicate observed summit clearance.</p></section><section class="card space-y-2"><h2 class="text-xl font-bold">Synthetic presets</h2><p>Classic, high, socked and clear presets are illustrative examples only. Their numbers and cloud layers are invented to test the interface. The live mode never replaces a failed data request with a synthetic prediction.</p></section><section class="card space-y-2"><h2 class="text-xl font-bold">For contributors</h2><p>See the <a href="https://github.com/samadler8/invert-boulder">README</a> for collecting independent airport METAR observations, retrieving issue-time-preserved GFS runs, training the models, adding summit observations, and running the local FastAPI server. Current provider data may be sparse for rare fog cases. The model refuses to train when it cannot validate both classes.</p></section></main></body></html>
+<!DOCTYPE html><html lang="en" class="dark"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Guide | Boulder Inversion Tracker</title><script src="https://cdn.tailwindcss.com"></script><style>body{background:#060911;color:#e2e8f0;font-family:system-ui,sans-serif}.card{background:#0f172a;border:1px solid #334155;border-radius:20px;padding:28px}a{color:#67e8f9}</style></head><body><header class="border-b border-slate-700 p-5"><nav class="max-w-4xl mx-auto flex justify-between"><strong>Boulder Inversion Tracker — Guide</strong><div class="space-x-5"><a href="/">Dashboard</a><a href="/science.html">Science</a></div></nav></header><main class="max-w-4xl mx-auto p-6 space-y-6"><section class="card space-y-2"><h1 class="text-2xl font-bold">Understanding the short-range tracker</h1><p>The live dashboard shows estimates for airport low-cloud ceiling conditions from an initialized HRRR run. Forecast lead times are strictly less than 40 hours from model initialization. Because model results are not distributed instantaneously, the remaining future window may be shorter than 40 hours.</p><p>Forecast probabilities are experimental and only valid to the extent independently observed verification supports them. The first model uses reports from Boulder Municipal Airport (KBDU), not photos from the Flatirons.</p></section><section class="card space-y-2"><h2 class="text-xl font-bold">Reading the probability and charts</h2><p>The large percentage is the average of an XGBoost model and a small CNN estimating a conservatively defined reported low-ceiling event. The models receive numerical weather predictions of surface humidity, visibility, cloud cover, winds and vertical structure. Click a day or an hourly bar to inspect a specific forecast valid time. The other chart mode shows predicted low-cloud coverage, not a measured cloud-top height.</p></section><section class="card space-y-2"><h2 class="text-xl font-bold">Elevation-specific outlook</h2><p>Each landmark is shown at its target elevation. Elevation-conditioned scenic training is not enabled without verified summit data. Otherwise it says <strong>Not trained</strong>. If enough reported low cloud bases exist, a separate regression model estimates the airport low-cloud <strong>base</strong> altitude, not the cloud-top or safe breakout elevation.</p><p>Do not use airport fog probability as a guarantee that Boulder is covered while Green Mountain is sunny. The diagram is schematic and does not indicate observed summit clearance.</p></section><section class="card space-y-2"><h2 class="text-xl font-bold">Synthetic presets</h2><p>Classic, high, socked and clear presets are illustrative examples only. Their numbers and cloud layers are invented to test the interface. The live mode never replaces a failed data request with a synthetic prediction.</p></section><section class="card space-y-2"><h2 class="text-xl font-bold">For contributors</h2><p>See the <a href="https://github.com/samadler8/invert-boulder">README</a> for collecting independent airport METAR observations, retrieving issue-time-preserved HRRR runs, training the models, adding summit observations, and running the local FastAPI server. Current provider data may be sparse for rare fog cases. The model refuses to train when it cannot validate both classes.</p></section></main></body></html>
 </file>
 
 <file path="index.html">
@@ -2440,7 +2455,7 @@ if __name__ == '__main__':
             <i class="fa-solid fa-circle-info text-cyan-400"></i>
             <span>This terrain graphic is schematic; live cloud top is not available.</span>
           </span>
-          <span class="font-mono text-[11px] text-slate-400">GFS issued run · Observed fog labels · Cloud top unknown</span>
+          <span class="font-mono text-[11px] text-slate-400">HRRR issued run · KBDU low-cloud ceiling labels · Summit clearance unknown</span>
         </div>
 
       </div>
@@ -2452,7 +2467,7 @@ if __name__ == '__main__':
       <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
         <div>
           <span class="text-xs font-bold tracking-widest text-cyan-400 uppercase">Interactive Day Selector</span>
-          <h3 class="text-lg font-extrabold text-white">Next 72 Hours — Airport Fog Outlook</h3>
+          <h3 class="text-lg font-extrabold text-white">Up to 40-Hour HRRR Forecast — Airport Low Clouds</h3>
         </div>
         <span class="text-xs text-slate-400">Click any day to inspect its full 24-hour hourly profile</span>
       </div>
@@ -2538,7 +2553,7 @@ if __name__ == '__main__':
             <div id="barLowClouds" class="bg-cyan-400 h-full rounded-full transition-all duration-500" style="width: 0%"></div>
           </div>
         </div>
-        <p class="text-xs text-slate-400" id="descLowClouds">GFS low cloud fraction near Boulder, not observed fog.</p>
+        <p class="text-xs text-slate-400" id="descLowClouds">HRRR low cloud fraction near KBDU, not a direct observed ceiling.</p>
       </div>
 
       <!-- Metric 2: Summit Sky Clearance -->
@@ -2602,7 +2617,7 @@ if __name__ == '__main__':
             <div id="barWind" class="bg-emerald-400 h-full rounded-full transition-all duration-500" style="width: 0%"></div>
           </div>
         </div>
-        <p class="text-xs text-slate-400" id="descWind">Wind direction and speed from GFS.</p>
+        <p class="text-xs text-slate-400" id="descWind">Wind direction and speed from HRRR.</p>
       </div>
 
     </section>
@@ -2685,7 +2700,7 @@ if __name__ == '__main__':
       <div class="flex items-center space-x-2">
         <span>© Boulder Inversion Tracker & Predictor</span>
         <span>•</span>
-        <span>Open-Meteo GFS forecast · Experimental ML</span>
+        <span>NOAA HRRR forecast · Experimental ML</span>
       </div>
       <div class="flex items-center space-x-4">
         <span>Boulder City: 5,400 ft</span>
@@ -2701,195 +2716,231 @@ if __name__ == '__main__':
 </html>
 </file>
 
-<file path="requirements.txt">
-# CPU-only training and locally hosted inference (no paid cloud service).
-numpy>=1.26,<3
-scikit-learn>=1.4,<2
-xgboost>=2.0,<4
-torch>=2.2,<3
-requests>=2.31,<3
-fastapi>=0.110,<1
-uvicorn>=0.29,<1
-# Tests: pip install -r requirements-dev.txt
-</file>
-
 <file path="science.html">
 <!DOCTYPE html><html lang="en" class="dark"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Science | Boulder Inversion Tracker</title><script src="https://cdn.tailwindcss.com"></script><style>body{background:#060911;color:#e2e8f0;font-family:system-ui,sans-serif}a{color:#67e8f9}.card{background:#0f172a;border:1px solid #334155;border-radius:20px;padding:28px}</style></head><body class="min-h-screen"><header class="border-b border-slate-700 p-5"><nav class="max-w-4xl mx-auto flex justify-between gap-4"><strong>Boulder Inversion Tracker — Science</strong><div class="space-x-5"><a href="/">Dashboard</a><a href="/guide.html">Guide</a></div></nav></header><main class="max-w-4xl mx-auto p-6 space-y-6">
 <section class="card space-y-3"><h1 class="text-2xl font-extrabold">Three different physical events</h1><p><strong>Temperature inversion:</strong> locally warmer air above colder air; a vertically resolved thermal phenomenon. <strong>Airport fog:</strong> measured near-surface visibility and clouds at a weather station. <strong>Scenic cloud sea:</strong> low clouds in the Boulder area with clear viewing at a particular higher elevation. None is equivalent to the others.</p><p>The current airport-fog ML output is trained with independent METAR observations. It does not establish a measured inversion or above-cloud summit event.</p></section>
-<section class="card space-y-3"><h2 class="text-xl font-bold">Numerical weather forecasts become ML features</h2><p>Open-Meteo serves individual historical and live NOAA GFS runs. We ingest surface forecast humidity, visibility, weather codes, clouds and wind, plus atmospheric temperature, humidity, wind, cloud cover and geopotential height at pressure levels. XGBoost also receives local time and forecast lead (hours between run initialization and valid time). The CNN receives five interpolated vertical channels: temperature, humidity, east-west and north-south wind, and forecast cloud cover.</p><p>All training and inference weather features come from a particular initialized GFS forecast run. The strict lead-time bound is less than 72 hours. An issued forecast is not replaced with the hindsight-laden stitched historical forecast archive.</p></section>
+<section class="card space-y-3"><h2 class="text-xl font-bold">Numerical weather forecasts become ML features</h2><p>The NOAA HRRR archive contains individually initialized model runs that can be selectively accessed using Herbie. We ingest surface forecast humidity, visibility, clouds, forecast cloud-base/top heights and wind, plus atmospheric temperature, humidity, wind, cloud-liquid mixing ratio and geopotential height at pressure levels. XGBoost also receives local time and forecast lead (hours between run initialization and valid time). The CNN receives five interpolated vertical channels: temperature, humidity, east-west and north-south wind, and forecast cloud-liquid mixing ratio.</p><p>All training and inference weather features come from a particular initialized HRRR forecast run. The strict lead-time bound is less than 40 hours. An issued forecast is not replaced with the hindsight-laden stitched historical forecast archive.</p></section>
 <section class="card space-y-3"><h2 class="text-xl font-bold">Independent observations and labels</h2><p>Airport KBDU/METAR visibility, `FG` weather reports and reported ceiling layers define the station fog target. Reports are retrieved independently from the Iowa Environmental Mesonet. Missing/ambiguous observations are not treated as clear conditions. A separate model may learn the altitude of the <strong>base</strong> of reported low BKN/OVC cloud at the airport, using its 5,288 ft MSL field elevation. Cloud <strong>top</strong> cannot be recovered from airport METAR data.</p><p>If independently verified mountain visibility observations are supplied with a timestamp and elevation, a third, elevation-conditioned XGBoost model can learn the joint airport-fog-and-summit-clear outcome. With no such data, the website displays “Not trained” for that outcome.</p></section>
-<section class="card space-y-3"><h2 class="text-xl font-bold">Training and uncertainty</h2><p>Train/validation/test partitions are chronological by forecast valid time, with a 72-hour gap to reduce leakage from overlapping forecast runs. Both fog classifiers can be calibrated on validation events. Holdout Brier, log-loss, ROC AUC and average precision are reported; rare-event class balance and validation selection remain concerns.</p><p>A model with positive GFS temperature gradients is only displaying a <em>forecast inversion signal</em>; there is no independent observed inversion training target yet. Keep the distinction visible in scientific interpretation.</p></section>
-<section class="card"><h2 class="text-xl font-bold mb-3">Primary sources</h2><p><a href="https://open-meteo.com/en/docs/single-runs-api">Open-Meteo Single Runs</a> · <a href="https://open-meteo.com/en/docs/gfs-api">GFS variable documentation</a> · <a href="https://mesonet.agron.iastate.edu/request/download.phtml?network=CO_ASOS">IEM observed METAR</a>. Full reproducibility instructions and caveats are in <a href="https://github.com/samadler8/invert-boulder">the repository README</a>.</p></section></main></body></html>
-</file>
-
-<file path="xgb_inversion.py">
-"""Compatibility entry point; implementation lives in inversion.models/train."""
-from inversion.models import train_xgb
-from inversion.train import main
-
-if __name__ == '__main__':
-    main()
+<section class="card space-y-3"><h2 class="text-xl font-bold">Training and uncertainty</h2><p>Train/validation/test partitions are chronological by forecast valid time, with a 40-hour gap to reduce leakage from overlapping forecast runs. The low-ceiling/fog classifiers can be calibrated on validation events. Holdout Brier, log-loss, ROC AUC and average precision are reported; rare-event class balance and validation selection remain concerns.</p><p>A model with positive HRRR temperature gradients is only displaying a <em>forecast inversion signal</em>; there is no independent observed inversion training target yet. Keep the distinction visible in scientific interpretation.</p></section>
+<section class="card"><h2 class="text-xl font-bold mb-3">Primary sources</h2><p><a href="https://rapidrefresh.noaa.gov/hrrr/">NOAA HRRR</a> · <a href="https://herbie.readthedocs.io/en/latest/">Herbie</a> · <a href="https://mesonet.agron.iastate.edu/request/download.phtml?network=CO_ASOS">IEM observed METAR</a>. Full reproducibility instructions and caveats are in <a href="https://github.com/samadler8/invert-boulder">the repository README</a>.</p></section></main></body></html>
 </file>
 
 <file path="README.md">
-# Boulder Inversion Tracker — short-range observation-trained edition
+# Boulder HRRR 40-hour low-cloud predictor (experimental)
 
-A local website and two small machine-learning models for **0–<72-hour** forecasts around Boulder, Colorado. Written for a MacBook; trained weights are small enough to commit to GitHub after you train them. **No pretrained model files are included** because independent historical observations and live public API requests have not been downloaded or validated here.
+This version supersedes the earlier Open-Meteo GFS 72-hour code. It trains on
+**original NOAA HRRR issued forecast runs** paired with **independent Boulder
+Municipal Airport (KBDU) METAR observations**. The default binary target is a
+**BKN/OVC/VV ceiling at or below 1,000 feet AGL at the airport**, not an actual
+thermodynamic inversion or a proven clear mountain summit. The dense-fog label
+is retained as a separate, much rarer training option.
 
-## What it actually predicts
+Models: XGBoost on tabular HRRR fields, 1D CNN on four vertical channels,
+independent regression of **reported cloud BASE** (not cloud top). The airport
+is a proxy for the Flatirons; model forecast cloud-base/top heights are predictors,
+not validated outcomes. The website explicitly does **not** claim mountain clearance.
 
-| Outcome | Ground truth | Trained model | What is shown |
-|---|---|---|---|
-| Airport fog/low ceiling | Independent KBDU airport METAR, conservative binary thresholds | XGBoost + 1D CNN | Calibrated model estimates of that **operational label**, NOT inversion probabilities |
-| Low cloud **base** elevation | Independent METAR `BKN`/`OVC`/`VV` ceiling heights, ft above airport terrain + 5,288 ft MSL | Separate XGBoost regression, **only if enough labels** | Predicted *base* elevation in feet MSL and validation residual band |
-| Scenic cloud sea above individual landmark | Human-verified `observed_summit_clear` at that elevation, joined with independently observed Boulder-area fog | Optional elevation-conditioned XGBoost classifier | Per-landmark scenic-event estimate **only for elevations with training labels** |
-| Atmospheric inversion | No independent vertical soundings included | **Not trained** | GFS-predicted vertical temperature warming diagnostic, NOT probability |
-| Actual cloud top | No reliable cloud-top observations included | **Not trained** | *Unknown*; cloud base must never be mistaken for cloud top |
+## 0. Free space / download cautions
 
-The airport is northeast of downtown Boulder; airport fog != city-center fog. Actual visibility and summit cloud decks may differ significantly across the foothills. A low airport METAR cloud base **cannot** tell us whether a summit is above a cloud layer.
+- **Recommended free disk space: 25–40 GB** on Apple Silicon, although a small
+  test can work with around 10–15 GB free. A Conda/PyTorch/Herbie environment is
+  often 2–6 GB; temporary indexed GRIB subsets are ordinarily much smaller than
+  whole HRRR files, and the final point JSONL/models are small.
+- **Internet transfer is the larger risk**: each HRRR forecast sample downloads
+  selected GRIB messages from both `sfc` and `prs` products. It may transfer tens
+  of MB per sample; thousands of samples can consume tens to hundreds of GB in
+  total, depending on the subset and archive. **Do not download whole HRRR GRIBs**
+  (full CONUS pressure product can approach ~400+ MB per forecast hour).
+- The script DELETES each temporary subset after reading the single point and
+  stores only compact JSONL samples. Caching raw data is not needed.
+- Default `collect` downloads **at most eight** new forecast pairs each invocation.
+  `--all` deliberately opts into a potentially very large multi-day download.
 
-### Why single GFS runs rather than stitched historical forecasts?
-
-Training features use historical **GFS initialization times** from Open-Meteo's **Single Runs API**, released for GFS and most other models from **April 2, 2026**. The valid timestamps are separated from forecast issue timestamps; lead time is an explicit XGBoost feature. Each run includes only forecast lead `0 <= lead < 72` hours (less than three days). This avoids treating hindsight from a stitched near-real-time forecast as though it were an issued 3-day forecast.
-
-Historical valid times can appear in several overlapping issued runs. We retain their distinct lead times, and the train/validation/test split is by **valid time** with a 72-hour gap so different predictions verifying the same observation cannot straddle a split. Future improvements should also group synoptic weather events, include lead-stratified evaluation, and reserve a separate calibration set.
-
-The live server retrieves an actual **initialized GFS run** (after an assumed 7-hour publication lag, with fallbacks to older 6-hour cycles) and discards hours before the current time or with lead >=72. It may show ~54–65 future hours, rather than a full 72 future hours. It does not silently substitute stitched forecasts if an initialized run is missing.
-
-This first implementation uses **GFS only** for consistent archive/live input schemas. HRRR may be more useful in the foothills at shorter lead times, but mixing HRRR into a GFS-trained model without a separately aligned archived training pipeline would cause train/serve drift. HRRR's forecast horizon and vertical cloud-cover availability also differ.
-
-## Setup (macOS)
-
-Requires Python 3.11+ and internet access for download or live inference. From the repository root:
+## 1. Merge this repository ZIP into your existing local repo
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
+cd ~/github/invert-boulder
+git status --short                      # Save/commit any work before overwrite
+git switch -c feature/hrrr-40h
+unzip -o ~/Downloads/invert-boulder-hrrr-40h.zip -d .
 ```
 
-### 1. Download independent airport observations
+If ZIP is in another folder, replace its path. Do not delete your existing
+`data/observed_bdu.csv`; the new data uses a different filename.
+
+## 2. Dependencies: use your working Python 3.12 Conda environment
+
+```bash
+conda activate inversion312
+conda install -c conda-forge herbie-data python-eccodes -y
+python -m pip install -r requirements-dev.txt
+python -c "from herbie import Herbie; import eccodes, xgboost, torch; print('ready')"
+python -m eccodes selfcheck
+python -m pytest -q tests/test_pipeline.py
+```
+
+`requirements-hrrr.txt` is available for pip-only installation; the Conda
+commands above are preferred for native GRIB dependencies on macOS.
+
+## 3. Retrieve a longer history of independent KBDU observations
 
 ```bash
 python -m inversion.observations \
-  --start 2026-04-02 --end 2026-10-20 \
-  --output data/observed_bdu.csv
+  --start 2018-07-13 --end 2026-10-20 \
+  --output data/observed_bdu_2018_2026.csv
 ```
 
-This downloads raw METAR reports from the [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu/request/download.phtml?network=CO_ASOS), selecting station `BDU` in `CO_ASOS`. It keeps observations nearest each UTC hour, independently of the weather model. It stores `observed_fog` as:
+The new observation CSV contains both `observed_low_ceiling` and `observed_fog`
+plus reported cloud base when present. Unknown sky conditions remain unlabeled.
+This observation download does not download HRRR data.
 
-- **1**: reported visibility <=1 statute mile *and* fog weather code (`FG`/`FZFG`) or reported low ceiling <=1,000 ft AGL;
-- **0**: visibility >=5 miles and no fog weather code;
-- **blank**: ambiguous or missing (NOT a negative).
+## 4. Inspect the HRRR archive without GRIB download
 
-The METAR observed low-cloud base is the lowest `BKN`, `OVC`, or `VV` reported layer at <=5,000 ft AGL converted to ft MSL using the airport elevation. That only describes **cloud base**, not cloud top, and may be missing.
+```bash
+python -m inversion.hrrr inspect --date 2025-01-15 --fxx 36
+```
 
-**This is a deliberately strict operational proxy for airport fog, not a universal meteorological inversion definition.** Many samples will be unlabeled, and there might not be enough positive cases in the archive. In that case training correctly refuses to produce a model. Inspect `data/observed_bdu.csv` and station sensor continuity before proceeding.
+You should see selected `sfc` and `prs` inventory entries for the requested
+forecast. If any required field is missing or the archive is unavailable,
+stop and inspect the error before the bulk download.
 
-### 2. Train both models on archived issued forecasts
+## 5. Download a tiny real-world test (eight forecast samples)
 
-For example, train through October 20, 2026 (leave at least 3 days for verification observations):
+```bash
+python -m inversion.hrrr collect \
+  --start 2025-01-15 --end 2025-01-17 \
+  --run-hour 0 --lead-hours 24,30,36,39 \
+  --max-pairs 8 --output data/hrrr_samples.jsonl
+```
+
+The downloader extracts nearest model grid point to KBDU (~40.0394,-105.2250),
+removes temporary large subsets, and appends a row to `data/hrrr_samples.jsonl`.
+Rerunning exactly the same command skips already completed run/lead pairs.
+
+Check what you downloaded:
+
+```bash
+python -m scripts.data_status \
+  --features data/hrrr_samples.jsonl \
+  --observations data/observed_bdu_2018_2026.csv
+
+du -sh data/* 2>/dev/null
+df -h .
+```
+
+> **Live archive integration caveat:** the code and offline tests were checked
+> without live NOAA access. The first indexed-HRRR download on your Mac is a
+> necessary integration test; GRIB inventory naming/availability can vary by
+> year. Don't run `--all` until the 8-sample test completes successfully.
+
+## 6. Expand to one winter, then to more years
+
+One winter, after the 8-sample test succeeds:
+
+```bash
+python -m inversion.hrrr collect \
+  --start 2024-12-01 --end 2025-02-28 \
+  --run-hour 0 --lead-hours 24,30,36,39 \
+  --all --output data/hrrr_samples.jsonl
+```
+
+Older HRRR runs before December 2, 2020 include lead hours through 36, not 39.
+The tool automatically skips these unavailable historical 39-hour forecasts.
+
+Additional winters (repeat with different years):
+
+```bash
+python -m inversion.hrrr collect \
+  --start 2023-12-01 --end 2024-02-29 \
+  --run-hour 0 --lead-hours 24,30,36,39 \
+  --all --output data/hrrr_samples.jsonl
+```
+
+Use several winters and some shoulder seasons before interpreting validation
+probabilities. A full eight-year daily 3/4-lead archive can be **thousands of
+samples and a very large cumulative internet download**. Build incrementally.
+
+## 7. Train independently observed KBDU low-ceiling classifier
+
+```bash
+python -m scripts.data_status \
+  --features data/hrrr_samples.jsonl \
+  --observations data/observed_bdu_2018_2026.csv
+
+python -m inversion.train \
+  --features data/hrrr_samples.jsonl \
+  --observations data/observed_bdu_2018_2026.csv \
+  --target low_ceiling
+```
+
+This trains XGBoost and the vertical-profile CNN and writes
+`models/xgb.json`, `models/cnn.pt`, and `models/manifest.json`, with held-out
+calibration and evaluation metrics. If fewer than three **distinct positive
+calendar days** occur in train, validation, or test, training refuses to make a
+probability model. Fetch more periods rather than oversampling one event.
+
+If you want to train **only the cloud-base regression** while building the
+classifier dataset:
 
 ```bash
 python -m inversion.train \
-  --start 2026-04-02 --end 2026-10-20 \
-  --observations data/observed_bdu.csv \
-  --run-every-hours 24
+  --features data/hrrr_samples.jsonl \
+  --observations data/observed_bdu_2018_2026.csv \
+  --base-only
 ```
 
-`--run-every-hours 24` downloads one 00 UTC run per day; 12 or 6 downloads more forecasts per day, increasing time and disk/network use. Raw run JSON is cached in `data/gfs_runs/` (Git-ignored). HTTP failures stop training instead of fabricating weather input. Some variables or model runs may be unavailable; support depends on provider coverage. To retry, rerun after the outage; completed runs remain cached.
+`--target fog` trains the rarer strict visibility/fog outcome if enough
+independent events are available. Do not assume it can be trained immediately.
 
-**Requirements for successful training:** At least 150 labeled training examples overall, positive and negative observations in each chronological subset, a meaningful split after 72-hour purges, and complete vertical GFS profiles. If fog is too rare in the available Apr–Oct 2026 archive, the script raises an informative error. Do not try to fix that with synthetic training labels and claim real-world probabilities.
+## 8. Prepare a sparse live HRRR forecast, then open the website
 
-Trained artifacts (automatically generated):
-
-```
-models/
-  xgb.json           airport-fog gradient-boosted trees
-  cnn.pt             vertical-profile CNN + train-only normalizer
-  manifest.json      feature schema, provenance, calibration, test scores
-  cloud_base.json    optional airport low-cloud-base regressor
-  scenic.json        optional labeled elevation-conditioned scenic classifier
-```
-
-The `.gitignore` excludes downloaded raw data but **does not exclude model weights**. Commit trained models only after auditing their data provenance, holdout metrics, and licensing.
-
-### 3. Optional independently labeled summit events
-
-METAR airport reports do **not** tell us whether Green Mountain or the First Flatiron is above the clouds. If you collect independent, timestamped summit camera/hiker observations, save them as a CSV:
-
-```csv
- timestamp,target_elevation_ft,observed_summit_clear
- 2026-08-10T12:00:00Z,8100,1
- 2026-08-10T13:00:00Z,8100,0
-```
-
-The timestamps must be UTC. `observed_summit_clear=1` means the landmark itself is independently observed clear, not necessarily a scenic cloud sea. The scenic **joint** target is `observed_airport_fog AND observed_summit_clear`. We omit the unknown airport-fog hours, rather than treating them as negatives. The altitude is an **explicit model input**, and the optional classifier is trained **only if** its observed labels support a proper chronological split. Only elevations appearing in the training labels are shown as having modeled scenic probabilities (never extrapolate to unverified altitudes automatically).
-
-Train with both sources:
+Training samples are at 24/30/36/39-hour leads, so the first live display is
+**sparse**, not a full hourly chart. Collect a recent extended cycle:
 
 ```bash
-python -m inversion.train \
-  --start 2026-04-02 --end 2026-10-20 \
-  --observations data/observed_bdu.csv \
-  --summit-labels data/summit_observations.csv
-```
-
-If summit labels are absent or insufficient, the website says **Not trained**, rather than guessing scenic success. Adding cloud-base observations is **not** a replacement for summit labels.
-
-### 4. Start the local website
-
-```bash
+python -m inversion.hrrr live --lead-hours 24,30,36,39
 python -m uvicorn inversion.server:app --reload
 ```
 
-Open **http://127.0.0.1:8000**. Other users can download the GitHub repository, install requirements, and use your committed artifacts without retraining. They still need internet to fetch new GFS forecasts (as well as Tailwind/FontAwesome/Google Fonts if not bundled locally).
+Open <http://127.0.0.1:8000>. To refresh underlying HRRR data, rerun the
+`hrrr live` command in another Terminal; the website refresh button rereads
+that cache. We intentionally do not hide a large GRIB download inside an HTTP
+request. Forecast horizon is measured **from issue time** (f00–f39), so the
+remaining forecast horizon from the current clock is shorter.
 
-HTTP endpoints: `/api/health` and `/api/forecast` (`?refresh=true` bypasses the 30-minute forecast response cache). `/api/forecast` includes forecast initialization time, lead time, both fog estimates, optional reported-cloud-base prediction, optional supervised scenic predictions and explicit `null` cloud top. It returns errors when models or live forecast data are unavailable.
-
-## Tests
+## 9. Publish safely
 
 ```bash
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
-node --check dashboard.js
+git add .
+git status --short
+git commit -m "Add HRRR archive point extractor and observed low-ceiling training"
+git push -u origin feature/hrrr-40h
 ```
 
-Tests use **only synthetic fixtures** to check file formats, run lead/time handling, model shapes, conservation of missing labels, model save/load/reload, optional elevation models, and the offline local API. Passing these tests does **NOT** measure scientific forecast skill. The live Open-Meteo/IEM endpoints could not be invoked from the build environment; run these commands on a networked machine and inspect actual responses.
+`data/*.csv`, `data/*.jsonl`, `data/hrrr_tmp`, and generated models are ignored
+by default. Only publish model artifacts after separately checking scientific
+skill, licenses, model compatibility, and commit size. Do not commit full GRIB
+files. A future release can explicitly commit validated weights for one-command
+local inference.
 
-## Architecture
+## Honest limitations
 
-```
-inversion/config.py         Shared schema, elevations, pressure levels, model/version
-inversion/weather.py        Open-Meteo GFS Single Runs HTTP download + cache
-inversion/observations.py   Independent Iowa Mesonet/METAR observation downloader
-inversion/features.py       Vertical interpolation; XGBoost and CNN input schema
-inversion/models.py         XGBoost + small CNN, sigmoid, Platt calibration, metrics
-inversion/train.py          Match issued runs to METAR; chronological split; optional base/scenic targets
-inversion/predict.py        Load exported weights, create model outputs per valid hour/elevation
-inversion/server.py         Local FastAPI and 30-min response caching
-dashboard.js                Interactive short-range dashboard, model caveats, scenarios
-index.html / guide.html / science.html   Site and public documentation
-tests/test_pipeline.py      Offline smoke + integration tests
-```
+- NOAA HRRR model grid values are not exact point measurements; steep terrain
+  adds representativeness error even at 3 km grid spacing.
+- KBDU METAR cloud-base is not cloud-top. The HRRR predicted cloud-top field
+  is an **input**, not independently verified truth.
+- The CNN uses four variables at five pressure levels, interpolated to 25 heights; this is not 25
+  independent observations and is not a spatial CNN.
+- The current training sample recipe focuses on 24–39 hour forecast leads;
+  the model **must not** be used at untrained leads without fresh validation.
+- Calendar-day grouping and sparse-hour rendering are provisional. A denser
+  operational forecast would require training and downloading more leads.
+- The public HRRR indexes expose the 13 selected surface fields and 25 pressure fields;
+  a real sample download and extraction still need validation on your Mac.
 
-## Scientific and engineering caveats
-
-1. **Not a verified thermal-inversion classifier.** Airport METAR measures fog/visibility/cloud bases; vertical thermal inversions require independent radiosonde or similar vertical observations. The forecast `forecast_inversion_warming_signal` is simply a GFS temperature-profile diagnostic.
-2. **Not a cloud-top estimator.** The optional regressor predicts a cloud **base** conditional on low-cloud ceiling reports. Its 80% validation residual band is not a conditional conformal prediction interval. It cannot identify the cloud top or a safe hike above clouds.
-3. **Rare events.** Boulder Airport fog events may be too scarce for reliable model fitting or calibration; the short GFS run archive (from April 2026) compounds that limitation. More features cannot repair missing labels.
-4. **Scenic-event dataset.** Hand/automated camera labels need quality control, daylight handling, repeat observations and enough cases across elevations and seasons. No automated webcam scraper is bundled because reliable permission/access and camera placement have not been established.
-5. **Meteorological resolution.** GFS is too coarse for some Front Range topographic effects. HRRR needs its own archive/feature validation before inclusion. Pressure-profile interpolation provides consistent grids, not finer actual measurements.
-6. **Lead-time and deployment.** Forecast run availability can lag initialization (often hours). The site always enforces `<72 hours since issue`, and new weather still requires an internet connection. Weather model updates over time can cause domain shift.
-7. **Evaluations.** Probabilities are calibrated on validation observations. The 72h split purge avoids trivial cross-run leakage but repeated weather-event dependence remains. Test-set Brier/ROC/AP are conditional on the sample selection, not guaranteed generalization. Next measure separate 0–24h, 24–48h and 48–72h performance against raw GFS weather-code/visibility baselines.
-8. **API terms.** Review [Open-Meteo terms](https://open-meteo.com/en/terms) and [IEM terms](https://mesonet.agron.iastate.edu/), and consider attribution, frequency limits and licensing before distributing commercially.
-
-## Source documentation
-
-- [Open-Meteo Single Runs API](https://open-meteo.com/en/docs/single-runs-api) — UTC `run` initialization and run archive dates.
-- [Open-Meteo GFS & HRRR](https://open-meteo.com/en/docs/gfs-api) — forecast variables and GFS variant availability.
-- [Iowa Environmental Mesonet ASOS request](https://mesonet.agron.iastate.edu/request/download.phtml?network=CO_ASOS) — direct METAR observations, `vsby`, `skyc*`, `skyl*`.
-- [Boulder Municipal Airport elevation](https://www.airnav.com/airport/KBDU) — estimated airport field elevation 5,288 ft MSL.
+References: [NOAA HRRR](https://rapidrefresh.noaa.gov/hrrr/),
+[Herbie documentation](https://herbie.readthedocs.io/en/latest/),
+[Iowa Mesonet METAR download](https://mesonet.agron.iastate.edu/request/download.phtml).
 </file>
 
 </files>

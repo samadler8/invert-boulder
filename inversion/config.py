@@ -5,10 +5,10 @@ MODEL_DIR = ROOT / 'models'
 DATA_DIR = ROOT / 'data'
 TIMEZONE = 'America/Denver'
 MODEL_SOURCE = 'hrrr'
-MODEL_VERSION = 'hrrr-kbdu-low-ceiling-v3'
+MODEL_VERSION = 'hrrr-kbdu-low-ceiling-v4'
 MAX_LEAD_HOURS = 40  # Valid times 0 <= fxx <=39 from issue time
 PRESSURE_LEVELS = (800, 750, 700, 650, 600)
-PROFILE_CHANNELS = ('temperature_c', 'rh_pct', 'u_ms', 'v_ms', 'cloud_liquid_g_kg')
+PROFILE_CHANNELS = ('temperature_c', 'rh_pct', 'u_ms', 'v_ms')
 PROFILE_LEVELS = 25
 PROFILE_TOP_AGL_M = 2000
 LANDMARKS_FT = {'Boulder': 5400, 'First Flatiron': 7200, 'Green Mountain': 8100}
@@ -20,7 +20,6 @@ FEATURE_NAMES = (
     'low_cloud_pct', 'mid_cloud_pct', 'high_cloud_pct',
     'forecast_visibility_log_m', 'forecast_pbl_height_m',
     'hrrr_forecast_cloud_base_msl_m', 'hrrr_forecast_cloud_top_msl_m',
-    'cloud_liquid_300m_gkg', 'cloud_liquid_750m_gkg',
     'wind_u_10m_ms', 'wind_v_10m_ms',
     't_delta_300m', 't_delta_750m', 'rh_300m', 'rh_750m',
     'wind_u_300m_ms', 'wind_v_300m_ms',

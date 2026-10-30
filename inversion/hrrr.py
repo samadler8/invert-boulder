@@ -28,7 +28,7 @@ SURFACE_REGEX = (
     r'HPBL:surface|HGT:cloud base|HGT:cloud top):'
 )
 PRESSURE_REGEX = (
-    r':(?:HGT|TMP|RH|UGRD|VGRD|CLWMR):(?:600|650|700|750|800) mb:'
+    r':(?:HGT|TMP|RH|UGRD|VGRD):(?:600|650|700|750|800) mb:'
 )
 
 
@@ -54,7 +54,15 @@ def download_product(init, fxx, product, pattern, scratch, *, verbose=False):
     inventory = h.inventory(search=pattern)
     if inventory is None or inventory.empty:
         raise RuntimeError(f'No HRRR {product} inventory messages for {init} F{fxx:02d}')
-    path = Path(h.download(pattern, save_dir=scratch, verbose=verbose, errors='raise'))
+    path = Path(
+        h.download(
+            pattern,
+            save_dir=scratch,
+            overwrite=True,
+            verbose=verbose,
+            errors="raise",
+        )
+    )
     try:
         values = decode_nearest(path)
         if len(values) != len(inventory):
@@ -98,7 +106,7 @@ def build_row(init, lead, surface, pressure):
         return value if math.isfinite(value) and ground <= value <= 16000 else float('nan')
     cb, ct = sane_height(cb), sane_height(ct)
     # Output is from model grid; pressure levels under local terrain are excluded.
-    layers = [(ground + 2.0, temp, humidity, u10, v10, None)]
+    layers = [(ground + 2.0, temp, humidity, u10, v10)]
     for level in PRESSURE_LEVELS:
         key = f'{level} mb'
         z = require(pressure, 'HGT', key)
@@ -106,8 +114,7 @@ def build_row(init, lead, surface, pressure):
             continue
         layers.append((z, require(pressure, 'TMP', key) - 273.15,
                        require(pressure, 'RH', key), require(pressure, 'UGRD', key),
-                       require(pressure, 'VGRD', key),
-                       require(pressure, 'CLWMR', key) * 1000))  # kg/kg -> g/kg
+                       require(pressure, 'VGRD', key)))
     layers.sort()
     if len(layers) < 4 or layers[-1][0] < ground + 2 + PROFILE_TOP_AGL_M:
         raise ValueError('Not enough above-ground HRRR pressure levels for 2 km profile')
@@ -116,19 +123,16 @@ def build_row(init, lead, surface, pressure):
         raise ValueError('Degenerate pressure-level geopotential heights')
     zgrid = np.linspace(ground + 2, ground + 2 + PROFILE_TOP_AGL_M, PROFILE_LEVELS)
     interp = lambda column, z: float(np.interp(z, zs, [r[column] for r in layers]))
-    # Cloud-liquid channel has no ground-level observation: extend the first
-    # actual pressure level downward rather than pretending we measured 0 g/kg.
-    c_z = [r[0] for r in layers[1:]]
-    c_v = [r[5] for r in layers[1:]]
-    cloud_at = lambda z: float(np.interp(z, c_z, c_v))
+    # Four independently supplied vertical fields. CLWMR is not in the
+    # retrieved pressure inventory, so do not invent a fifth profile channel.
     prof = np.asarray([
         [interp(k, z) for z in zgrid] for k in range(1, 5)
-    ] + [[cloud_at(z) for z in zgrid]], dtype=np.float32)
+    ], dtype=np.float32)
     hr = 2 * math.pi * (local.hour / 24)
     yr = 2 * math.pi * (local.timetuple().tm_yday / 365.25)
     row = np.asarray([
         temp, temp - dew, humidity, low, mid, high, math.log1p(max(0, vis)),
-        pbl, cb, ct, cloud_at(ground+302), cloud_at(ground+752), u10, v10,
+        pbl, cb, ct, u10, v10,
         interp(1, ground+302) - temp, interp(1, ground+752) - temp,
         interp(2, ground+302), interp(2, ground+752),
         interp(3, ground+302), interp(4, ground+302),
