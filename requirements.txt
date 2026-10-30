@@ -1,0 +1,17 @@
+# Base Data Science Dependencies
+numpy>=1.22.0
+pandas>=1.4.0
+scikit-learn>=1.0.0
+
+# Approach A Dependencies
+xgboost>=1.6.0
+lightgbm>=3.3.0
+
+# Approach B Dependencies
+torch>=2.0.0
+
+# Weather / Atmospheric Data Fetching (For Next LLM to connect)
+metpy>=1.4.0
+sounderpy>=0.5.0
+herbie-data>=2023.3.0
+xarray>=2022.03.0
