@@ -1,17 +1,9 @@
-# Base Data Science Dependencies
-numpy>=1.22.0
-pandas>=1.4.0
-scikit-learn>=1.0.0
-
-# Approach A Dependencies
-xgboost>=1.6.0
-lightgbm>=3.3.0
-
-# Approach B Dependencies
-torch>=2.0.0
-
-# Weather / Atmospheric Data Fetching (For Next LLM to connect)
-metpy>=1.4.0
-sounderpy>=0.5.0
-herbie-data>=2023.3.0
-xarray>=2022.03.0
+# CPU-only training and locally hosted inference (no paid cloud service).
+numpy>=1.26,<3
+scikit-learn>=1.4,<2
+xgboost>=2.0,<4
+torch>=2.2,<3
+requests>=2.31,<3
+fastapi>=0.110,<1
+uvicorn>=0.29,<1
+# Tests: pip install -r requirements-dev.txt

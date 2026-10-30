@@ -56,51 +56,14 @@
   </header>
 
   <main class="max-w-4xl mx-auto px-4 py-8 space-y-8 flex-grow">
-    
-    <section class="glass-card rounded-3xl p-8">
-      <h2 class="text-2xl font-extrabold text-white mb-4 border-b border-slate-700 pb-2">What is this Dashboard?</h2>
-      <p class="text-slate-300 leading-relaxed mb-4">
-        The Boulder Inversion Tracker is a highly specialized meteorological tool designed for photographers, hikers, and weather enthusiasts in Boulder, Colorado. It predicts the exact probability and elevation of temperature inversions—the phenomenon that traps the city in a dense fog deck while upper elevations sit under clear blue skies[cite: 3].
-      </p>
-      <p class="text-slate-300 leading-relaxed">
-        The dashboard uses a 3-level elevation profile comparing the <strong>City of Boulder (5,400 ft)</strong>, the <strong>1st Flatiron (7,200 ft)</strong>, and the <strong>Green Mountain Summit (8,100 ft)</strong> to determine which locations will be above the clouds[cite: 3].
-      </p>
-    </section>
-
-    <section class="glass-card rounded-3xl p-8">
-      <h2 class="text-2xl font-extrabold text-white mb-4 border-b border-slate-700 pb-2">Understanding the Terminology (Presets)</h2>
-      <ul class="space-y-4 text-slate-300">
-        <li><strong class="text-cyan-400"><i class="fa-solid fa-satellite-dish mr-2"></i>Live Forecast:</strong> Pulls real-time atmospheric sounding data to give you the current 7-day outlook[cite: 3].</li>
-        <li><strong class="text-emerald-400"><i class="fa-solid fa-trophy mr-2"></i>Classic Inversion:</strong> The "holy grail" setup. The cloud ceiling stops around 6,700 ft. The city is foggy, but if you hike to the 1st Flatiron or Green Mountain, you will break through the clouds into the sunshine[cite: 3].</li>
-        <li><strong class="text-amber-400"><i class="fa-solid fa-cloud mr-2"></i>High Deck:</strong> A deeper moisture layer. The fog ceiling rises to around 7,500 ft. The 1st Flatiron is stuck in the fog, and only the very top of Green Mountain sits above the clouds[cite: 3].</li>
-        <li><strong class="text-blue-400"><i class="fa-solid fa-smog mr-2"></i>Socked In:</strong> The moisture layer is very deep (above 8,100 ft). All three landmarks (City, Flatiron, Green Mountain) are trapped inside the cloud layer[cite: 3].</li>
-        <li><strong class="text-rose-400"><i class="fa-solid fa-sun mr-2"></i>Bluebird / Downslope:</strong> No inversion exists. The air is either very dry, or strong westerly winds (Chinooks) have blown the moisture away, resulting in clear air everywhere[cite: 3].</li>
-      </ul>
-    </section>
-
-    <section class="glass-card rounded-3xl p-8">
-      <h2 class="text-2xl font-extrabold text-white mb-4 border-b border-slate-700 pb-2">How to Use the Interactive Charts</h2>
-      <div class="space-y-6">
-        <div>
-          <h3 class="text-lg font-bold text-emerald-300 mb-2">1. The 3D Elevation Cross-Section</h3>
-          <p class="text-slate-300 text-sm">
-            This diagram visually maps the estimated cloud top against Boulder's terrain. It features dynamic tags that tell you whether each of the 3 landmarks is currently <strong>☁️ IN FOG</strong> or <strong>☀️ ABOVE CLOUDS</strong>[cite: 3]. When inversion probability drops below 20%, the fog disappears and a yellow "Clear Mountain Air" banner displays[cite: 3].
-          </p>
-        </div>
-        <div>
-          <h3 class="text-lg font-bold text-cyan-300 mb-2">2. The 7-Day Interactive Strip</h3>
-          <p class="text-slate-300 text-sm">
-            Click on any day in the 7-day strip. Doing so will recalculate the entire page for that specific day's peak inversion window, updating the gauge, metrics, and diagrams[cite: 3].
-          </p>
-        </div>
-        <div>
-          <h3 class="text-lg font-bold text-amber-300 mb-2">3. The 24-Hour Diurnal Timeline</h3>
-          <p class="text-slate-300 text-sm">
-            Located below the 7-day outlook, this chart lets you scrub through the day hour-by-hour. You can toggle between viewing the <strong>Inversion Probability (%)</strong> and the estimated <strong>Cloud Top Elevation (ft)</strong>[cite: 3]. Click on any bar in this chart, and the 3D Elevation Cross-Section above will instantly animate to show the conditions for that exact hour[cite: 3].
-          </p>
-        </div>
-      </div>
-    </section>
-  </main>
+<section class="glass-card rounded-3xl p-8 space-y-4">
+<h2 class="text-2xl font-extrabold">Using the experimental predictor</h2>
+<p>Run the Python server from the README, open <a href="index.html" class="text-cyan-400 underline">Dashboard</a>, and inspect the morning scores for each day. The two separate XGBoost and CNN estimates are shown in the verdict panel. Their average is the large score.</p>
+<p class="text-amber-300 font-semibold">A proxy-trained score is NOT a proven probability of an inversion, a sea of clouds, or successful summit visibility.</p>
+<p>Click a day and a bar to inspect its forecast hour. The second chart mode shows forecast low cloud cover. Time labels follow Boulder local time including the DST transition.</p>
+<p>The preset buttons create entirely synthetic scenarios to demonstrate the chart and schematic. They do not represent weather forecasts. Only the Live button requests forecast data.</p>
+<p>In live mode the diagram will not invent a cloud-top altitude or promise that a landmark is above fog. Check actual webcams, local weather observations, wind and trail conditions before hiking.</p>
+<p>If the dashboard shows <strong>Models not available</strong>, train and save the models first (see <a href="https://github.com/samadler8/invert-boulder" class="text-cyan-400 underline">repository README</a>). A network connection is needed to fetch GFS forecasts.</p>
+</section></main>
 </body>
 </html>

@@ -19,3 +19,14 @@ dist/
 .env
 .env.local
 *.log
+
+# Large/raw locally fetched historical data and generated model artifacts
+__pycache__/
+.pytest_cache/
+.venv/
+*.pyc
+data/raw/
+data/*.csv
+models/*.pt
+models/*.json
+!models/.gitkeep

@@ -56,62 +56,23 @@
   </header>
 
   <main class="max-w-4xl mx-auto px-4 py-8 space-y-8 flex-grow">
-    
-    <section class="glass-card rounded-3xl p-8">
-      <h2 class="text-2xl font-extrabold text-white mb-4 border-b border-slate-700 pb-2">What is a Temperature Inversion?</h2>
-      <p class="text-slate-300 leading-relaxed mb-4">
-        Normally, as you climb higher in elevation, the air temperature drops (this is known as the normal lapse rate). A <strong>temperature inversion</strong> occurs when this rule is flipped upside down. A layer of warm air slides over the top of the mountains, acting like a lid. This lid traps cold, moist air down in the valley floor. 
-      </p>
-      <p class="text-slate-300 leading-relaxed">
-        When the temperature of that trapped cold air reaches its dew point, it condenses into a thick deck of fog. If you hike up the mountain, you actually walk from the freezing fog <em>into</em> the warm, sunny air layer above.
-      </p>
-    </section>
-
-    <section class="glass-card rounded-3xl p-8">
-      <h2 class="text-2xl font-extrabold text-white mb-4 border-b border-slate-700 pb-2">How This App Predicts Inversions</h2>
-      <p class="text-slate-300 leading-relaxed mb-6">
-        Because Boulder inversions are notoriously difficult to predict, this dashboard fetches hourly atmospheric sounding data from the <strong>Open-Meteo API</strong>[cite: 3] specifically tailored to Boulder's coordinates (Lat 40.0150, Lon -105.2705)[cite: 3].
-      </p>
-
-      <h3 class="text-lg font-bold text-cyan-400 mb-3">The 5 Core Algorithm Criteria</h3>
-      <p class="text-sm text-slate-300 mb-4">The dashboard calculates a 0-100% Inversion Probability Score based on five strict variables[cite: 3]:</p>
-      
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div class="bg-slate-900 border border-slate-700 p-4 rounded-xl">
-          <h4 class="font-bold text-white text-sm"><i class="fa-solid fa-cloud text-cyan-400 mr-2"></i>1. Low Cloud Cover (Max 35 pts)</h4>
-          <p class="text-xs text-slate-400 mt-1">Evaluates the presence of a saturated airmass sitting directly on the valley floor[cite: 3].</p>
-        </div>
-        <div class="bg-slate-900 border border-slate-700 p-4 rounded-xl">
-          <h4 class="font-bold text-white text-sm"><i class="fa-solid fa-sun text-amber-400 mr-2"></i>2. Upper Sky Clearance (Max 25 pts)</h4>
-          <p class="text-xs text-slate-400 mt-1">Checks mid and high-level cloud cover. A low fog deck isn't visually stunning if the sky above it is also cloudy[cite: 3].</p>
-        </div>
-        <div class="bg-slate-900 border border-slate-700 p-4 rounded-xl">
-          <h4 class="font-bold text-white text-sm"><i class="fa-solid fa-temperature-arrow-up text-rose-400 mr-2"></i>3. Thermal Cap (Max 25 pts)</h4>
-          <p class="text-xs text-slate-400 mt-1">Compares the surface temperature to the 750hPa layer (~8,000 ft). If the air at 8,000 ft is warmer than the surface, a strong inversion lid exists[cite: 3].</p>
-        </div>
-        <div class="bg-slate-900 border border-slate-700 p-4 rounded-xl">
-          <h4 class="font-bold text-white text-sm"><i class="fa-solid fa-droplet text-blue-400 mr-2"></i>4. Moisture Saturation (Max 10 pts)</h4>
-          <p class="text-xs text-slate-400 mt-1">Measures how close the surface temperature is to the dew point, ensuring fog can actually form[cite: 3].</p>
-        </div>
-        <div class="bg-slate-900 border border-slate-700 p-4 rounded-xl md:col-span-2">
-          <h4 class="font-bold text-white text-sm"><i class="fa-solid fa-wind text-emerald-400 mr-2"></i>5. Surface Wind Flow (Max 5 pts / Heavy Penalty)</h4>
-          <p class="text-xs text-slate-400 mt-1">Rewards light easterly (upslope) winds which push plains moisture into the mountains. Strongly penalizes (subtracts 20 points) for westerly downslope Chinook winds over 14mph, which instantly scour the moisture away[cite: 3].</p>
-        </div>
-      </div>
-    </section>
-
-    <section class="glass-card rounded-3xl p-8">
-      <h2 class="text-2xl font-extrabold text-white mb-4 border-b border-slate-700 pb-2">Calculating Cloud Ceiling</h2>
-      <p class="text-slate-300 leading-relaxed mb-4">
-        Once the probability score is generated, the tool attempts to calculate the height of the fog deck (Cloud Ceiling). 
-        It does this by assessing the <strong>temperature delta</strong> (the difference between the surface temp and the temp at 8,100 feet).
-      </p>
-      <ul class="list-disc pl-5 space-y-2 text-slate-300 text-sm">
-        <li><strong>Delta > 2.5°C:</strong> A very strong lid creates a low, compressed cloud deck (~6,700 ft)[cite: 3].</li>
-        <li><strong>Delta > 0°C:</strong> A standard lid creates a mid-level deck (~7,500 ft)[cite: 3].</li>
-        <li><strong>Delta < 0°C:</strong> A weak lid allows moisture to billow high into the mountains (~8,300 ft), socking in the peaks[cite: 3].</li>
-      </ul>
-    </section>
-  </main>
+<section class="glass-card rounded-3xl p-8 space-y-3">
+<h2 class="text-2xl font-extrabold">What is a temperature inversion?</h2>
+<p>Normally air temperature decreases with altitude in the lower atmosphere. A thermal inversion is a layer where temperature instead increases with height. A stable layer can trap moisture below it, but an inversion alone does not imply dense fog or a picturesque cloud sea.</p>
+<p>The cloud sea you want also requires low cloud or fog around Boulder and sufficiently clear conditions near the Flatirons or Green Mountain. These are distinct physical observations and should eventually be labeled separately.</p>
+</section>
+<section class="glass-card rounded-3xl p-8 space-y-3">
+<h2 class="text-2xl font-extrabold">What are the two models learning?</h2>
+<p><strong>XGBoost</strong> learns nonlinear interactions between surface humidity, cloud forecasts, wind, interpolated temperature gradients, time of day and season.</p>
+<p><strong>1D CNN</strong> scans standardized vertical profiles of temperature, relative humidity and horizontal wind components. Each profile spans 0–2,000 meters above local model ground, sampled on 25 levels by interpolation between available GFS pressure layers. That interpolated resolution does not add atmospheric information.</p>
+<p>Both models use the same GFS forecast times and a chronological train/validation/test split. Independent, real observed labels are required to make the validation physically meaningful.</p>
+</section>
+<section class="glass-card rounded-3xl p-8 space-y-3">
+<h2 class="text-2xl font-extrabold">What is the limitation of proxy training?</h2>
+<p>Until real labels are available, the optional training command constructs a proxy outcome from the historical weather model's own low cloud, mid/high cloud and visibility predictions. This teaches post-processing of a forecast-model diagnostic, not the observed reality. It can reproduce a model's mistakes.</p>
+<p>Historical stitched forecasts use the first hours of repeated model runs, while a 7-day live forecast has much longer lead times. A proper backtest must use archived forecasts at the same lead times paired with independent observations. A statistically calibrated proxy score cannot be advertised as a real-world inversion probability.</p>
+<p>Cloud-top height, summit visibility and hiking safety are not estimated in live mode. Historic preset values are fictional demo scenes.</p>
+<p>Data origin: <a href="https://open-meteo.com/en/docs/gfs-api" class="text-cyan-400 underline">Open-Meteo GFS API</a> and <a href="https://open-meteo.com/en/docs/historical-forecast-api" class="text-cyan-400 underline">Historical Forecast API</a>; NOAA weather-model input.</p>
+</section></main>
 </body>
 </html>
