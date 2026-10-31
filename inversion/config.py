@@ -1,4 +1,4 @@
-"""HRRR model contract. Never reuse models trained on older GFS features."""
+"""Public NOAA HRRR forecast and landmark configuration."""
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_DIR = ROOT / 'models'
@@ -6,7 +6,7 @@ DATA_DIR = ROOT / 'data'
 TIMEZONE = 'America/Denver'
 MODEL_SOURCE = 'hrrr'
 MODEL_VERSION = 'hrrr-kbdu-low-ceiling-v4'
-MAX_LEAD_HOURS = 40  # ML contract: keep existing trained-model semantics unchanged
+MAX_LEAD_HOURS = 40  # Retained for historical forecast-archive compatibility
 DISPLAY_MAX_LEAD_HOURS = 49  # HRRR extended cycles provide f00-f48 for heuristic display
 PRESSURE_LEVELS = (800, 750, 700, 650, 600)
 PROFILE_CHANNELS = ('temperature_c', 'rh_pct', 'u_ms', 'v_ms')

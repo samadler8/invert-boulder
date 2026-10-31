@@ -11,14 +11,13 @@ Usage:
 """
 import argparse
 import csv
-import hashlib
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from .config import DATA_DIR, MODEL_DIR, MAX_LEAD_HOURS, DISPLAY_MAX_LEAD_HOURS, TIMEZONE
+from .config import DATA_DIR, MAX_LEAD_HOURS, DISPLAY_MAX_LEAD_HOURS, TIMEZONE
 from .heuristic import evaluate, VERSION as HEURISTIC_VERSION
 from .scenic import VERSION as SCENIC_VERSION
 
@@ -108,9 +107,7 @@ def compact_prediction(row, predicted=None):
            'tempDelta': row.get('observables', {}).get('tempDelta'),
            'ml_probability': None, 'xgb_probability': None,
            'cnn_probability': None, 'event': None}
-    if predicted:
-        for key in ('ml_probability', 'xgb_probability', 'cnn_probability', 'event'):
-            out[key] = predicted.get(key)
+    # Legacy SQL/JSON fields remain null in new forecasts for schema compatibility.
     return out
 
 
@@ -137,45 +134,12 @@ def save_prediction(row, *, origin='captured', captured_at=None, db_path=DEFAULT
         return result.rowcount == 1
 
 
-def capture_published_live(rows, *, published_at=None, db_path=DEFAULT_DB,
-                           model_dir=MODEL_DIR):
-    """Record the published HRRR cache, and optionally the active ML model.
-
-    This runs at every successful CLI live refresh, whether anyone opens the
-    browser or not. Incompatible ML weights never block the heuristic archive.
-    """
+def capture_published_live(rows, *, published_at=None, db_path=DEFAULT_DB, model_dir=None):
+    """Save real captured HRRR heuristic scores; never load archived ML weights."""
     published_at = published_at or datetime.now(timezone.utc)
     count = sum(save_prediction(row, origin='captured', db_path=db_path,
                                 captured_at=published_at) for row in rows)
-    manifest_file = Path(model_dir) / 'manifest.json'
-    if not manifest_file.exists():
-        return {'heuristic_saved': count, 'ml_saved': 0}
-    try:
-        import numpy as np
-        from .predict import Predictor
-        predictor = Predictor(model_dir)
-        trained_leads = set(int(x) for x in predictor.manifest['trained_lead_hours'])
-        eligible = [r for r in rows if int(r['lead_hours']) in trained_leads]
-        if not eligible:
-            return {'heuristic_saved': count, 'ml_saved': 0}
-        ml_rows = [{**r, 'features': np.asarray(r['features'], dtype=np.float32),
-                    'profile': np.asarray(r['profile'], dtype=np.float32)} for r in eligible]
-        predictions = predictor.predict(ml_rows)
-        revision = (predictor.manifest['version'] + ':' +
-                    hashlib.sha256(manifest_file.read_bytes()).hexdigest()[:12])
-        added = 0
-        for row, pred in zip(eligible, predictions):
-            added += save_prediction(row, origin='captured', db_path=db_path,
-                                     captured_at=published_at, ml_model_version=revision,
-                                     predicted={'ml_probability': pred['probability'],
-                                                'xgb_probability': pred['xgb_probability'],
-                                                'cnn_probability': pred['cnn_probability'],
-                                                'event': pred['event']})
-        return {'heuristic_saved': count, 'ml_saved': added}
-    except (ValueError, RuntimeError, FileNotFoundError, KeyError, ImportError, OSError) as exc:
-        print(f'ML snapshot unavailable ({type(exc).__name__}: {exc}); heuristic saved.')
-        return {'heuristic_saved': count, 'ml_saved': 0}
-
+    return {'heuristic_saved': count, 'ml_saved': 0}
 
 
 def needs_reconstruction_upgrade(forecast):

@@ -1,9 +1,4 @@
-# CPU-only training and locally hosted inference (no paid cloud service).
-numpy>=1.26,<3
-scikit-learn>=1.4,<2
-xgboost>=2.0,<4
-torch>=2.2,<3
 requests>=2.31,<3
+numpy>=1.26,<3
 fastapi>=0.110,<1
 uvicorn>=0.29,<1
-# Tests: pip install -r requirements-dev.txt

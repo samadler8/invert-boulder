@@ -1,10 +1,9 @@
-"""Serve independent HRRR heuristic forecasts, with ML side-by-side if trained.
+"""Serve independent HRRR scenic forecasts and observation history.
 
 Run `python -m inversion.hrrr live` separately to refresh the on-disk forecast.
 The API never silently substitutes synthetic weather for a failed live fetch.
 """
 from datetime import datetime, timezone, timedelta, date
-import hashlib
 import threading
 from uuid import uuid4
 
@@ -12,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel
 from fastapi.responses import FileResponse
 
-from .config import ROOT, DATA_DIR, MODEL_DIR, MAX_LEAD_HOURS, DISPLAY_MAX_LEAD_HOURS
+from .config import ROOT, DATA_DIR, MODEL_DIR, DISPLAY_MAX_LEAD_HOURS
 from .heuristic import evaluate, VERSION, WEIGHTS
 from .scenic import VERSION as SCENIC_VERSION, MAX_DESIRED_DECK_TOP_FT_MSL
 from .hrrr import load_jsonl
@@ -48,7 +47,7 @@ def solar(date_local: str | None = None):
 
 @app.get('/api/health')
 def health():
-    return {'status': 'ok', 'trained_models_available': (MODEL_DIR / 'manifest.json').exists(),
+    return {'status': 'ok', 'trained_models_available': False,  # Legacy response key; ML archived.
             'forecast_horizon_hours_exclusive': DISPLAY_MAX_LEAD_HOURS,
             'live_samples_available': (DATA_DIR / 'hrrr_live.jsonl').exists(),
             'heuristic_available': True, 'heuristic_version': VERSION,
@@ -83,51 +82,11 @@ def forecast(refresh: bool = False):
             'cloud_base_80pct_residual_interval_ft_msl': None,
         })
 
-    ml_available = False
-    ml_note = 'No trained model yet. The heuristic runs independently without ML weights.'
-    manifest = None
-    if (MODEL_DIR / 'manifest.json').exists():
-        try:
-            # Delay heavyweight numpy/PyTorch/XGBoost import until models exist.
-            import numpy as np
-            from .predict import Predictor
-            predictor = Predictor(MODEL_DIR)
-            manifest = predictor.manifest
-            allowed = set(manifest.get('trained_lead_hours', []))
-            eligible = [(i, r) for i, r in enumerate(rows)
-                        if int(r['lead_hours']) in allowed]
-            if eligible:
-                ml_rows = [{**r, 'features': np.asarray(r['features'], dtype=np.float32),
-                            'profile': np.asarray(r['profile'], dtype=np.float32)}
-                           for _, r in eligible]
-                predictions = predictor.predict(ml_rows)
-                for (idx, _), prediction in zip(eligible, predictions):
-                    out[idx].update({
-                        'ml_probability': prediction['probability'],
-                        'xgb_probability': prediction['xgb_probability'],
-                        'cnn_probability': prediction['cnn_probability'],
-                        'event': prediction['event'],
-                        'estimated_low_cloud_base_ft_msl': prediction['estimated_low_cloud_base_ft_msl'],
-                        'cloud_base_80pct_residual_interval_ft_msl': prediction['cloud_base_80pct_residual_interval_ft_msl'],
-                    })
-                    for site, fitted_site in zip(out[idx]['landmarks'], prediction['landmarks']):
-                        if site['name'] == fitted_site['name']:
-                            site['scenic_probability'] = fitted_site['scenic_probability']
-            ml_available = True
-            ml_note = 'Trained KBDU low-ceiling/fog probabilities are shown only for trained forecast lead times.'
-        except (ValueError, RuntimeError, FileNotFoundError, KeyError, ImportError, OSError) as exc:
-            # Damaged/incompatible weights must not suppress a valid heuristic.
-            ml_note = f'ML weights unavailable ({type(exc).__name__}: {exc}). HRRR heuristic remains available.'
-
-    # Store exactly what was computed now; the archive never silently rewrites
-    # old heuristic versions or probabilities after a model update.
-    ml_version = (str(manifest['version']) + ':' +
-                  hashlib.sha256((MODEL_DIR / 'manifest.json').read_bytes()).hexdigest()[:12]
-                  if ml_available and manifest else '')
+    # ML pipeline is archived. Forecast scores come solely from public HRRR fields.
     for r, predicted in zip(rows, out):
         save_prediction(r, db_path=DATA_DIR / 'forecast_history.sqlite3',
                         captured_at=now, predicted=predicted,
-                        ml_model_version=ml_version if predicted['ml_probability'] is not None else '')
+                        ml_model_version='')
 
     return {
         'source': 'NOAA HRRR issued GRIB2 point forecast near KBDU',
@@ -146,15 +105,12 @@ def forecast(refresh: bool = False):
             'max_desired_deck_top_ft_msl': MAX_DESIRED_DECK_TOP_FT_MSL,
             'quantity': '0-100 mountain above-clouds suitability index (not a probability)',
         },
+        # Compatibility metadata for older dashboard clients; never loads model files.
         'model': {
-            'ml_available': ml_available,
-            'target': manifest['target'] if ml_available else None,
-            'verified_observations': ml_available,
-            'warning': ml_note,
-            'test_metrics': manifest['test_metrics'] if ml_available else None,
-            'cloud_base_available': bool(manifest['cloud_base']['available']) if ml_available else False,
-            'scenic_available': bool(manifest['scenic']['available']) if ml_available else False,
-            'max_lead_hours_exclusive': MAX_LEAD_HOURS,
+            'ml_available': False, 'target': None, 'verified_observations': False,
+            'warning': 'ML archived. Forecasts are public-data heuristic indices, not calibrated probabilities.',
+            'test_metrics': None, 'cloud_base_available': False,
+            'scenic_available': False, 'max_lead_hours_exclusive': DISPLAY_MAX_LEAD_HOURS,
             'heuristic_display_max_lead_hours_exclusive': DISPLAY_MAX_LEAD_HOURS,
         },
         'hours': out,
@@ -428,3 +384,101 @@ def window():
                         'A recent issued run may end before now + 48h. '
                         'Uncovered hours are unavailable, not estimated.'),
     }
+
+
+# On-demand enrichment for *existing* future forecasts downloaded before the
+# spatial-transect feature. This never downloads all 48h or rewrites history.
+class TransectRequest(BaseModel):
+    timestamp: str
+
+_transect_lock = threading.Lock()
+_transect_job = None
+
+
+def _run_transect_refresh(job_id, timestamp):
+    global _transect_job
+    try:
+        from .hrrr import (download_product, load_jsonl, write_jsonl)
+        from .transect import assemble
+        rows = load_jsonl(DATA_DIR / 'hrrr_live.jsonl')
+        selected = next((r for r in rows if r.get('timestamp') == timestamp), None)
+        if selected is None:
+            raise ValueError('Selected forecast is no longer in the live cache')
+        if selected.get('observables', {}).get('foothills_transect'):
+            note = 'Transect already available for selected forecast.'
+        else:
+            run = datetime.fromisoformat(selected['run_utc'].replace('Z', '+00:00'))
+            lead = int(selected['lead_hours'])
+            if lead < 0 or lead >= DISPLAY_MAX_LEAD_HOURS:
+                raise ValueError('Forecast lead is outside HRRR display range')
+            scratch = DATA_DIR / 'hrrr_tmp'
+            surf_pattern = (r':(?:HGT:surface|RH:2 m above ground|'
+                            r'LCDC:low cloud layer|MCDC:middle cloud layer|'
+                            r'HCDC:high cloud layer):')
+            prs_pattern = r':(?:HGT|RH):(?:600|650|700|750|800) mb:'
+            sfc = download_product(run, lead, 'sfc', surf_pattern, scratch, transect=True)
+            prs = download_product(run, lead, 'prs', prs_pattern, scratch, transect=True)
+            transect = assemble(sfc, prs)
+            if not transect or not transect.get('points'):
+                raise RuntimeError('HRRR did not return usable foothills-grid samples')
+            with _transect_lock:
+                if _transect_job and _transect_job['id'] == job_id:
+                    _transect_job['message'] = 'Saving decoded transect to local forecast cache...'
+            # Maintain atomic writes to each local file; never discard other
+            # forecast rows or alter historical snapshots in the SQLite archive.
+            for filename in ('hrrr_live.jsonl', 'quicklook_forecast_cache.jsonl'):
+                destination = DATA_DIR / filename
+                if not destination.exists():
+                    continue
+                updated = load_jsonl(destination)
+                changed = False
+                for row in updated:
+                    if row.get('timestamp') == timestamp and row.get('run_utc') == selected['run_utc']:
+                        row.setdefault('observables', {})['foothills_transect'] = transect
+                        changed = True
+                if changed:
+                    stage = destination.with_name(destination.name + '.transect-next')
+                    write_jsonl(stage, updated, mode='w')
+                    stage.replace(destination)
+            note = 'Transect saved for selected forecast. Reloading local weather data will show the map.'
+        with _transect_lock:
+            if _transect_job and _transect_job['id'] == job_id:
+                _transect_job.update(state='complete', message=note)
+    except Exception as exc:
+        with _transect_lock:
+            if _transect_job and _transect_job['id'] == job_id:
+                _transect_job.update(state='error', message=f'{type(exc).__name__}: {exc}')
+
+
+@app.post('/api/transect/refresh', status_code=202)
+def refresh_transect(request: TransectRequest, background: BackgroundTasks):
+    global _transect_job
+    try:
+        target = as_utc(request.timestamp)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(400, 'Expected a valid UTC forecast timestamp') from exc
+    if target < datetime.now(timezone.utc) - timedelta(hours=1) or target > datetime.now(timezone.utc) + timedelta(hours=49):
+        raise HTTPException(400, 'Select an available near-term forecast hour')
+    timestamp = utc_str(target)
+    rows = load_jsonl(DATA_DIR / 'hrrr_live.jsonl')
+    if not any(r.get('timestamp') == timestamp for r in rows):
+        raise HTTPException(404, 'Forecast hour not downloaded. Refresh the future forecast first.')
+    with _refresh_lock:
+        if _refresh_job is not None and _refresh_job['state'] == 'running':
+            raise HTTPException(409, 'A general HRRR refresh is already running')
+    with _transect_lock:
+        if _transect_job is not None and _transect_job['state'] == 'running':
+            raise HTTPException(409, 'A foothills transect download is already running')
+        job_id = uuid4().hex
+        _transect_job = {'id': job_id, 'state': 'running',
+                         'message': 'Downloading only the selected HRRR surface/humidity fields...'}
+    background.add_task(_run_transect_refresh, job_id, timestamp)
+    return dict(_transect_job)
+
+
+@app.get('/api/transect/refresh/status')
+def transect_refresh_status(job_id: str):
+    with _transect_lock:
+        if _transect_job is None or _transect_job['id'] != job_id:
+            raise HTTPException(404, 'Unknown transect refresh job')
+        return dict(_transect_job)

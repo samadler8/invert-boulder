@@ -33,6 +33,11 @@
     }
   </script>
 
+  <!-- Optional OpenStreetMap basemap for spatial HRRR markers. If offline,
+       the built-in SVG coordinate plot remains fully usable. -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
   <!-- Google Fonts & FontAwesome Icons -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -273,6 +278,48 @@
         <div class="rounded-xl bg-slate-900/85 border border-slate-800 p-3"><p class="text-[11px] text-slate-400">Low-deck top</p><strong id="explorerTop" class="text-sm font-bold text-slate-100">Unverified</strong></div>
       </div>
       <p id="explorerNotice" class="text-xs leading-relaxed text-amber-200">This atmospheric illustration is not a camera image, measured cloud top, or probability of standing above cloud.</p>
+    </section>
+
+    <!-- Horizontal HRRR transect. Coordinate diagram not a terrain basemap. -->
+    <section class="glass-card rounded-3xl p-5 sm:p-6 space-y-4" id="foothillsTransect" aria-label="HRRR geographic transect between Boulder and the Flatirons">
+      <div class="flex flex-wrap items-start justify-between gap-4">
+        <div class="max-w-3xl">
+          <p class="text-[11px] font-bold uppercase tracking-[.2em] text-cyan-400">New · Spatial HRRR weather map</p>
+          <h2 class="text-2xl font-extrabold text-white">Boulder → Flatirons → Green Mountain</h2>
+          <p class="text-sm text-slate-400 mt-1">Compare <strong class="text-slate-100">low, middle, high cloud cover and relative humidity</strong> at multiple forecast grid locations for the same hour. This is a coordinate map, not a satellite image or a measured cloud-top map.</p>
+        </div>
+        <div class="flex flex-col items-start sm:items-end gap-2">
+          <label for="transectMetric" class="text-xs text-slate-300 font-semibold">Color map by</label>
+          <select id="transectMetric" onchange="changeTransectMetric(this.value)" class="bg-slate-900 text-cyan-100 border border-slate-600 rounded-lg px-3 py-2 text-xs">
+            <option value="low_cloud_pct">Low clouds</option>
+            <option value="mid_cloud_pct">Middle clouds</option>
+            <option value="high_cloud_pct">High clouds</option>
+            <option value="surface_rh_pct">Surface relative humidity</option>
+            <option value="rh_at_8133ft_pct">Relative humidity at 8,133 ft MSL</option>
+          </select>
+        </div>
+      </div>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div class="rounded-2xl bg-slate-950/70 border border-slate-800 p-3 space-y-2">
+          <div class="flex items-center justify-between gap-2 text-xs"><strong class="text-slate-200">Forecast sample locations</strong><span id="transectMapTime" class="text-slate-400">Select an HRRR forecast hour</span></div>
+          <div id="transectLeaflet" class="hidden rounded-xl overflow-hidden" style="height:320px;" aria-label="Interactive OpenStreetMap basemap with HRRR sampled cloud and humidity points"></div>
+          <svg id="transectMap" viewBox="0 0 640 320" class="w-full h-auto" role="img" aria-label="Latitude and longitude diagram of six points from Boulder airport to Green Mountain"></svg>
+          <div class="flex items-center justify-between gap-2 text-[11px] text-slate-400"><span id="transectMapSource">Coordinate diagram · North ↑ · optional OpenStreetMap basemap</span><span id="transectCells">Model-grid cells: —</span></div>
+        </div>
+        <div class="rounded-2xl bg-slate-950/70 border border-slate-800 p-3 space-y-2">
+          <div><strong class="text-sm text-slate-100">Humidity by altitude</strong><p class="text-[11px] text-slate-400">Absolute altitude (ft MSL) · HRRR 2 m RH + 800–600 hPa RH · interpolation only between resolved heights</p></div>
+          <div id="transectHeatmap" class="overflow-x-auto" aria-live="polite">Select an HRRR forecast to view the vertical humidity profile.</div>
+          <p class="text-[11px] text-slate-400"><span class="text-cyan-300">Cool blue = more humid</span> · <span class="text-amber-300">warm amber = drier</span> · gray = missing / below model terrain. This is <em>humidity, not cloud fraction at that altitude</em>.</p>
+        </div>
+      </div>
+      <div id="transectSelectedDetails" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2" aria-live="polite"></div>
+      <div class="flex flex-wrap justify-between items-center gap-3 border-t border-slate-700/80 pt-3">
+        <p id="transectProvenance" class="text-xs text-slate-400 max-w-3xl">Weather along the route is forecast on ~3 km model cells, not independently observed at each named location. Points at nearby locations may share one grid cell.</p>
+        <div class="flex flex-col sm:items-end gap-1">
+          <button id="transectFetchButton" type="button" onclick="fetchSelectedTransect()" class="rounded-xl border border-cyan-700 bg-cyan-900/50 hover:bg-cyan-900 px-4 py-2 text-xs font-bold text-cyan-100">Load spatial data for selected hour</button>
+          <span id="transectFetchStatus" class="text-[11px] text-slate-400" role="status"></span>
+        </div>
+      </div>
     </section>
 
     <!-- Values already present in HRRR cached point data; no new NOAA downloads. -->
@@ -521,8 +568,8 @@
       <div id="scenicDetails" aria-live="polite" class="space-y-3">Loading HRRR humidity and cloud layers…</div>
     </section>
 
-    <!-- Explicitly separate an uncalibrated atmospheric heuristic from a trained airport event probability. -->
-    <section class="grid grid-cols-1 lg:grid-cols-2 gap-4" aria-label="Heuristic and machine learning forecasts">
+    <!-- Separate the two public-data indices from forecast limitations. -->
+    <section class="grid grid-cols-1 lg:grid-cols-2 gap-4" aria-label="Heuristic scores and interpretation">
       <div class="glass-card rounded-3xl p-5 space-y-3">
         <div class="flex flex-wrap items-center justify-between gap-2">
           <h3 class="text-base font-bold text-cyan-300">Low-cloud / inversion setup index (original)</h3>
@@ -533,14 +580,10 @@
         <p id="modeledCloudTop" class="text-xs text-slate-400"></p>
       </div>
       <div class="glass-card rounded-3xl p-5 space-y-3">
-        <div class="flex flex-wrap items-center justify-between gap-2">
-          <h3 class="text-base font-bold text-emerald-300">ML: observed airport low-ceiling / fog</h3>
-          <span class="text-xs border border-slate-600 text-slate-300 rounded-full px-2 py-1">When trained</span>
-        </div>
-        <div id="mlProbability" class="text-4xl font-extrabold font-mono text-white" aria-live="polite">--</div>
-        <p id="mlStatus" class="text-xs text-slate-300">Training not yet complete.</p>
-        <p id="mlBreakdown" class="text-xs text-slate-400">XGBoost and CNN probabilities will appear here when available.</p>
-        <p class="text-xs text-amber-300">The ML target is a METAR-observed airport event, not the heuristic's inversion setup and not a summit-clear probability.</p>
+        <h3 class="text-base font-bold text-emerald-300">What the atmospheric forecast can tell us</h3>
+        <p class="text-sm text-slate-200">The scenic index favors low cloud around Boulder, a drier layer at summit elevation, and little mid/high cloud. The low-cloud index measures the fog/inversion setup separately.</p>
+        <p class="text-xs text-slate-400">Both are transparent, hand-designed indices calculated from NOAA HRRR. They are not event probabilities, measured cloud-top heights, or verified summit visibility.</p>
+        <p class="text-xs text-cyan-200">Compare HRRR forecast vintages and KBDU observations below. See the spatial transect for location-to-location uncertainty.</p>
       </div>
     </section>
 
@@ -846,7 +889,7 @@
       <div class="flex items-center space-x-2">
         <span>© Boulder Inversion Tracker & Predictor</span>
         <span>•</span>
-        <span>NOAA HRRR forecast · Experimental ML</span>
+        <span>NOAA HRRR · Public-data scenic forecast</span>
       </div>
       <div class="flex items-center space-x-4">
         <span>Boulder City: 5,400 ft</span>

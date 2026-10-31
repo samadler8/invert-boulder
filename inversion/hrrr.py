@@ -16,6 +16,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
+from .transect import assemble as assemble_transect, TRANSECT_POINTS
 from .config import (DATA_DIR, OBS_LAT, OBS_LON, TIMEZONE, MAX_LEAD_HOURS,
                      PRESSURE_LEVELS, PROFILE_LEVELS, PROFILE_TOP_AGL_M,
                      FEATURE_NAMES)
@@ -40,7 +41,7 @@ PRESSURE_REGEX = (
 )
 
 
-def decode_nearest(path, lat=OBS_LAT, lon=OBS_LON, *, neighbors=None):
+def decode_nearest(path, lat=OBS_LAT, lon=OBS_LON, *, neighbors=None, with_grid=False):
     """Return scalar values in GRIB message order (no full-grid arrays stored)."""
     from eccodes import codes_grib_new_from_file, codes_grib_find_nearest, codes_release
     result = []
@@ -57,16 +58,28 @@ def decode_nearest(path, lat=OBS_LAT, lon=OBS_LON, *, neighbors=None):
                         try:
                             sample = codes_grib_find_nearest(gid, near_lat, near_lon % 360, npoints=1)
                             value = float(sample[0].value)
-                            others.append(value if math.isfinite(value) else None)
+                            if with_grid:
+                                near = sample[0]
+                                grid_lat = getattr(near, 'lat', None)
+                                grid_lon = getattr(near, 'lon', None)
+                                distance = getattr(near, 'distance', None)
+                                others.append({
+                                    'value': value if math.isfinite(value) else None,
+                                    'latitude': float(grid_lat) if grid_lat is not None else None,
+                                    'longitude': float(grid_lon) if grid_lon is not None else None,
+                                    'distance_km': float(distance) if distance is not None else None,
+                                })
+                            else:
+                                others.append(value if math.isfinite(value) else None)
                         except (ValueError, RuntimeError, IndexError, TypeError, OSError):
-                            others.append(None)
+                            others.append({'value': None} if with_grid else None)
                     result.append((center, others))
             finally:
                 codes_release(gid)
     return result
 
 
-def download_product(init, fxx, product, pattern, scratch, *, verbose=False, spatial=False):
+def download_product(init, fxx, product, pattern, scratch, *, verbose=False, spatial=False, transect=False):
     """Use index-based byte-range subsetting; return indexed scalars."""
     from herbie import Herbie
     h = Herbie(init.strftime('%Y-%m-%d %H:%M'), model='hrrr', product=product,
@@ -76,24 +89,37 @@ def download_product(init, fxx, product, pattern, scratch, *, verbose=False, spa
         raise RuntimeError(f'No HRRR {product} inventory messages for {init} F{fxx:02d}')
     path = Path(h.download(pattern, save_dir=scratch, verbose=verbose, errors='raise'))
     try:
-        values = decode_nearest(path, neighbors=SPATIAL_CLOUD_POINTS if spatial else None)
+        cloud_points = SPATIAL_CLOUD_POINTS if spatial else ()
+        track_points = tuple((key, lat, lon) for key, _, lat, lon, _ in TRANSECT_POINTS) if transect else ()
+        neighbors = tuple(cloud_points) + track_points
+        values = decode_nearest(path, neighbors=neighbors or None, with_grid=transect)
         if len(values) != len(inventory):
             raise RuntimeError(f'{product} GRIB fields {len(values)} != index entries {len(inventory)}')
         out = {}
         samples = {name: {} for name, _, _ in SPATIAL_CLOUD_POINTS} if spatial else None
+        track = {key: {} for key, _, _, _, _ in TRANSECT_POINTS} if transect else None
         for (_, item), val in zip(inventory.iterrows(), values):
             name = str(item['variable']).upper()
             level = str(item['level']).strip().lower()
-            if spatial:
-                center, neighbors = val
+            if neighbors:
+                center, point_values = val
                 out[(name, level)] = center
-                if name in ('LCDC', 'MCDC', 'HCDC'):
-                    for (point_name, _, _), value in zip(SPATIAL_CLOUD_POINTS, neighbors):
+                if spatial and name in ('LCDC', 'MCDC', 'HCDC'):
+                    for (point_name, _, _), reading in zip(SPATIAL_CLOUD_POINTS, point_values):
+                        value = reading['value'] if transect else reading
                         samples[point_name][{'LCDC':'low_cloud_pct',
                                              'MCDC':'mid_cloud_pct',
                                              'HCDC':'high_cloud_pct'}[name]] = value
+                if transect:
+                    for (point_name, _, _, _, _), reading in zip(TRANSECT_POINTS, point_values[len(cloud_points):]):
+                        track[point_name][(name, level)] = reading.get('value')
+                        if '_grid' not in track[point_name] and reading.get('latitude') is not None:
+                            track[point_name]['_grid'] = {
+                                key: reading.get(key) for key in ('latitude', 'longitude', 'distance_km')}
             else:
                 out[(name, level)] = val
+        if transect:
+            out['_transect_fields'] = track
         if spatial:
             out['_spatial_cloud_samples'] = [
                 {'label': label, 'latitude': lat, 'longitude': lon, **samples[label]}
@@ -175,6 +201,7 @@ def build_row(init, lead, surface, pressure):
         'observables': {
             'lowClouds': low, 'midClouds': mid, 'highClouds': high,
             'spatial_cloud_samples': surface.get('_spatial_cloud_samples'),
+            'foothills_transect': assemble_transect(surface, pressure),
             'surfTemp': temp, 'dewPoint': dew, 'rh': humidity,
             'tempDelta': interp(1, ground+302)-temp,
             'windSpeed': math.hypot(u10, v10)*2.23693629, 'windDir': direction,
@@ -187,9 +214,9 @@ def build_row(init, lead, surface, pressure):
     }
 
 
-def fetch_point(init, fxx, scratch):
-    s = download_product(init, fxx, 'sfc', SURFACE_REGEX, scratch, spatial=True)
-    p = download_product(init, fxx, 'prs', PRESSURE_REGEX, scratch)
+def fetch_point(init, fxx, scratch, *, transect=False):
+    s = download_product(init, fxx, 'sfc', SURFACE_REGEX, scratch, spatial=True, transect=transect)
+    p = download_product(init, fxx, 'prs', PRESSURE_REGEX, scratch, transect=transect)
     return build_row(init, fxx, s, p)
 
 
@@ -222,7 +249,7 @@ def historical_pairs(start, end, run_hour, leads):
         cur += timedelta(days=1)
 
 
-def collect(pairs, output, scratch, max_pairs=8):
+def collect(pairs, output, scratch, max_pairs=8, *, transect=False):
     output = Path(output)
     seen = {(r['run_utc'], int(r['lead_hours'])) for r in load_jsonl(output)}
     completed = 0
@@ -233,7 +260,7 @@ def collect(pairs, output, scratch, max_pairs=8):
         if max_pairs is not None and completed >= max_pairs:
             break
         print(f'HRRR {init:%Y-%m-%d %HZ} F{fxx:02d} -> {output}', flush=True)
-        row = fetch_point(init, fxx, scratch)
+        row = fetch_point(init, fxx, scratch, transect=transect)
         write_jsonl(output, [row])
         completed += 1
         seen.add(key)
@@ -316,7 +343,7 @@ def main():
         # Don't destroy a working live forecast cache if a download fails.
         staging = args.output.with_suffix(args.output.suffix + '.next')
         staging.unlink(missing_ok=True)
-        collect(pairs, staging, scratch, max_pairs=None)
+        collect(pairs, staging, scratch, max_pairs=None, transect=True)
         staging.replace(args.output)
         # Capture the precise instant the complete cache became publishable by
         # the website, not the earlier partial-download time.

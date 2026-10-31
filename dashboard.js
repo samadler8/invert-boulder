@@ -12,6 +12,11 @@
     const ELEV_GREEN_MT = 8133;
 
     // State object
+    let leafletTransectMap = null;
+    let leafletTransectLayers = null;
+    let transectMetric = 'low_cloud_pct';
+    let transectSelected = 'green';
+    let transectRefreshPolling = false;
     let solarTimesCache = new Map();
     let explorerPlayback = null;
     let solarLoading = new Set();
@@ -47,7 +52,7 @@
     };
 
     /**
-     * Fetch live HRRR-derived heuristic and optional observation-trained ML
+     * Fetch live HRRR-derived heuristic indices
      */
     async function fetchWeatherData(refresh = false) {
       const refreshIcon = document.getElementById('refreshIcon');
@@ -63,7 +68,7 @@
         state.selectedDayIdx = Math.min(1, state.daysData.length - 1);
         state.selectedHourIdx = state.daysData[state.selectedDayIdx].peakHour;
         document.getElementById('apiStatusText').textContent = payload.model.ml_available
-          ? 'Scenic + low-cloud indices + KBDU ML' : 'Scenic + low-cloud indices (no ML yet)';
+          ? 'Scenic + low-cloud indices' : 'Scenic + low-cloud indices';
         document.getElementById('statusBadge').classList.remove('hidden');
         document.getElementById('modelCaveat').textContent = payload.heuristic.warning + ' ' + payload.model.warning;
         setActivePresetBtn('live');
@@ -79,9 +84,6 @@
         document.getElementById('heuristicComponents').textContent = 'No live forecast data available.';
         document.getElementById('scenicDetails').textContent = 'No live scenic diagnostic available.';
         document.getElementById('scenicScore').textContent = '—';
-        document.getElementById('mlStatus').textContent = 'No HRRR forecast loaded.';
-        document.getElementById('mlProbability').textContent = '--';
-        document.getElementById('mlBreakdown').textContent = '';
         document.getElementById('modeledCloudTop').textContent = '';
         // Never replace a failed live forecast with a seemingly real demo.
         state.isLive = true;
@@ -93,6 +95,7 @@
         document.getElementById('explorerNotice').textContent = 'No usable live forecast cache. The schematic does not substitute synthetic weather.';
         document.getElementById('explorerSlider').disabled = true;
         document.getElementById('forecastMetricsExtended').textContent = 'Forecast measurements unavailable.';
+        renderFoothillsTransect({});
         document.getElementById('fogRect').setAttribute('opacity','0');
         document.getElementById('fogTopPuffs').setAttribute('opacity','0');
         document.getElementById('breakoutLineGroup').style.display = 'none';
@@ -451,8 +454,8 @@
               ? `Actually captured by this app: ${fmt(p.captured_at_utc)}`
               : `Reconstructed after the event · heuristic version: ${p.heuristic_version || 'unknown'}`));
           card.appendChild(mk('p', 'text-xs text-slate-400', p.ml_probability == null
-            ? 'ML: not captured / unavailable'
-            : `Airport ML: ${Math.round(p.ml_probability * 100)}% (${p.event || 'airport event'})`));
+            ? 'ML archived'
+            : `Legacy ML (historical only): ${Math.round(p.ml_probability * 100)}% (${p.event || 'airport event'})`));
           const detail = document.createElement('details');
           detail.className = 'border-t border-slate-700 pt-2';
           detail.appendChild(mk('summary', 'text-xs text-cyan-300 cursor-pointer',
@@ -566,7 +569,7 @@
             if (item.ml_probability != null) {
               const ml = document.createElement('p');
               ml.className = 'text-xs text-emerald-300';
-              ml.textContent = `Airport ML: ${Math.round(item.ml_probability * 100)}%`;
+              ml.textContent = `Legacy ML (historical only): ${Math.round(item.ml_probability * 100)}%`;
               card.appendChild(ml);
             }
             if (isPast) {
@@ -746,6 +749,7 @@
       renderWeatherExplorer(currentHourData, dayObj);
       renderSolarForDay(dayObj);
       renderExtendedMetrics(currentHourData);
+      renderFoothillsTransect(currentHourData);
     }
 
     /**
@@ -1084,21 +1088,21 @@
         score.textContent = site.scenic_heuristic_score == null ? (site.name === 'Boulder' ? 'Valley reference' : 'Scenic index unavailable') : `Scenic heuristic ${site.scenic_heuristic_score}/100`;
         const mlBadge = document.createElement('p');
         mlBadge.className = 'text-xs text-slate-400';
-        mlBadge.textContent = site.scenic_probability == null ? 'Verified scenic ML: not trained' : `Experimental scenic ML: ${Math.round(site.scenic_probability * 100)}%`; 
+        mlBadge.textContent = site.scenic_probability == null ? 'Summit outcome: not verified' : `Experimental scenic estimate: ${Math.round(site.scenic_probability * 100)}%`; 
         const relation = site.relative_to_modeled_cloud_top;
         const modelHint = relation === 'above_modeled_cloud_top' ? 'HRRR cloud-top field below this elevation.' : relation === 'below_modeled_cloud_top' ? 'HRRR cloud-top field above this elevation.' : relation === 'near_modeled_cloud_top' ? 'Near HRRR modeled cloud top (±450 ft).' : 'HRRR cloud-top height unavailable.';
         const explanation = document.createElement('p');
         explanation.className = 'text-xs text-slate-400 mt-1';
         explanation.textContent = site.scenic_probability === null
           ? `No verified scenic probability. ${modelHint} Cloud-top field may include higher clouds and need not describe Boulder\'s low cloud deck.`
-          : `Experimental independently trained scenic probability. ${modelHint}`;
+          : `Legacy archived scenic probability. ${modelHint}`;
         if (site.scenic_heuristic_reason) explanation.textContent = site.scenic_heuristic_reason + ' RH at summit: ' + (site.forecast_rh_at_summit_pct ?? 'N/A') + '%. Unverified HRRR proxy, not a probability.';
         block.append(name, score, mlBadge, explanation);
         panel.appendChild(block);
       });
       const b = h.estimated_low_cloud_base_ft_msl;
       const range = h.cloud_base_80pct_residual_interval_ft_msl;
-      caption.textContent = b === null ? 'Airport cloud-base regression unavailable: not trained or insufficient reported ceilings.'
+      caption.textContent = b === null ? 'HRRR cloud-base and humidity diagnostics are forecast fields, not a verified low-cloud top.'
         : `Estimated low-cloud BASE near KBDU: ${b.toLocaleString()} ft MSL` +
           (range ? ` (validation 80% absolute-residual band: ${range[0].toLocaleString()}–${range[1].toLocaleString()} ft).` : '.') +
           ' This is NOT the top of the cloud layer or a guarantee of a clear peak.';
@@ -1167,34 +1171,18 @@
       node.appendChild(text);
     }
 
-    /** Display the heuristic continuously and independent ML only when present. */
+    /** Display the transparent HRRR indices continuously. */
     function renderForecastComparison(h) {
       const componentNode = document.getElementById('heuristicComponents');
-      const mlStatus = document.getElementById('mlStatus');
-      const mlNumber = document.getElementById('mlProbability');
-      const mlBreakdown = document.getElementById('mlBreakdown');
       const top = document.getElementById('modeledCloudTop');
       if (!state.isLive) {
         componentNode.textContent = 'Synthetic preset. No real forecast ingredients.';
         renderScenicEvidence(h);
-        mlStatus.textContent = 'Synthetic demonstration only.';
-        mlNumber.textContent = '--';
-        mlBreakdown.textContent = '';
         top.textContent = 'No real forecast cloud height.';
         return;
       }
       renderHeuristicEvidence(componentNode, h);
       renderScenicEvidence(h);
-      if (h.mlScore === null) {
-        mlStatus.textContent = 'Not trained for this forecast lead (or no weights installed).';
-        mlNumber.textContent = '--';
-        mlBreakdown.textContent = 'When trained, this card displays P(low airport ceiling), not P(inversion or scenic clouds).';
-      } else {
-        const target = h.event === 'observed_airport_fog' ? 'airport fog-like event' : 'airport ceiling ≤1,000 ft AGL';
-        mlStatus.textContent = `Observation-trained probability of ${target}.`;
-        mlNumber.textContent = `${h.mlScore}%`;
-        mlBreakdown.textContent = `XGBoost: ${h.xgbScore}% · CNN: ${h.cnnScore}%`;
-      }
       const cloudTop = h.forecast_cloud_top_ft_msl;
       const cloudBase = h.forecast_cloud_base_ft_msl;
       top.textContent = `HRRR modeled cloud base: ${cloudBase == null ? 'not reported' : cloudBase.toLocaleString() + ' ft MSL'} · cloud top: ${cloudTop == null ? 'not reported' : cloudTop.toLocaleString() + ' ft MSL'}. Model forecast fields; not independently verified cloud-deck bounds.`;
@@ -1220,7 +1208,7 @@
         thTitle.textContent = 'Check webcams and local observations';
         thDesc.textContent = 'A model forecast cannot guarantee you will climb above fog. Check current cloud bases, visibility, wind and trail conditions.';
         boTitle.textContent = h.estimated_low_cloud_base_ft_msl !== null ? `Reported-cloud-base estimate ~${Math.round(h.estimated_low_cloud_base_ft_msl).toLocaleString()} ft MSL` : 'Cloud-base and cloud-top unavailable';
-        boDesc.textContent = 'The elevation model estimates the base of a low cloud layer at KBDU when such a ceiling is reported. The top of the deck and summit clearance remain unknown unless independently trained.';
+        boDesc.textContent = 'HRRR cloud base and RH profile are diagnostics, not observed cloud top. Summit clearance remains unverified.';
         gearTitle.textContent = 'Prepare for uncertain conditions';
         gearDesc.textContent = 'Carry a headlamp, warm and windproof layers, and navigation. Avoid committing to a hike based on this experimental score alone.';
         return;
@@ -1468,6 +1456,274 @@
         const a = Math.max(0,Math.min(100,minuteOfDay(solar.sunrise)/14.4));
         const b = Math.max(0,Math.min(100,(minuteOfDay(solar.sunset)-minuteOfDay(solar.sunrise))/14.4));
         document.getElementById('daylightBar').innerHTML = `<div class="bg-slate-700" style="width:${a}%"></div><div class="bg-gradient-to-r from-amber-500 via-sky-400 to-amber-500" style="width:${b}%"></div><div class="bg-slate-700 flex-1"></div>`;
+      }
+    }
+
+    const ROUTE_TARGETS = [
+      {id:'kbdu',name:'Boulder airport',latitude:40.0394,longitude:-105.2250},
+      {id:'east_boulder',name:'East Boulder',latitude:40.0260,longitude:-105.2470},
+      {id:'downtown',name:'Central Boulder',latitude:40.0150,longitude:-105.2705},
+      {id:'chautauqua',name:'Chautauqua',latitude:39.9978,longitude:-105.2814},
+      {id:'flatiron',name:'First Flatiron',latitude:39.990472,longitude:-105.294667},
+      {id:'green',name:'Green Mountain',latitude:39.9794304,longitude:-105.3016578},
+    ];
+    const svgNS = 'http://www.w3.org/2000/svg';
+    function createSvgElement(tag, attrs = {}, value = '') {
+      const element = document.createElementNS(svgNS, tag);
+      Object.entries(attrs).forEach(([key, val]) => element.setAttribute(key, String(val)));
+      if (value) element.textContent = value;
+      return element;
+    }
+    function renderFoothillsTransect(h) {
+      const data = state.isLive ? h?.foothills_transect : null;
+      const points = Array.isArray(data?.points) ? data.points : ROUTE_TARGETS.map(target => ({...target}));
+      const map = document.getElementById('transectMap');
+      const matrix = document.getElementById('transectHeatmap');
+      const details = document.getElementById('transectSelectedDetails');
+      if (!map || !matrix || !details) return;
+      const available = Boolean(data && Array.isArray(data.points) && data.points.length);
+      const metricLabels = {
+        low_cloud_pct:'Low-cloud cover', mid_cloud_pct:'Middle-cloud cover',
+        high_cloud_pct:'High-cloud cover', surface_rh_pct:'2 m relative humidity',
+        rh_at_8133ft_pct:'RH at 8,133 ft MSL'
+      };
+      const percent = value => finiteNumber(value) === null ? '—' : `${Math.round(Number(value))}%`;
+      const positions = points.map(p => ({...p,
+        x: 45 + (p.longitude + 105.312) / (.100) * 545,
+        y: 23 + (40.047 - p.latitude) / (.077) * 262
+      }));
+      // Blue encodes a large forecast cloud or RH fraction. Gray is unknown.
+      const shade = value => {
+        const n = finiteNumber(value);
+        if (n === null) return '#64748b';
+        return `hsl(${Math.round(40 + 160 * Math.max(0, Math.min(100, n)) / 100)} 72% 53%)`;
+      };
+      map.replaceChildren();
+      map.appendChild(createSvgElement('rect',{x:0,y:0,width:640,height:320,rx:12,fill:'#081529'}));
+      for (let k=0;k<5;k++) {
+        const y=24+k*63;
+        map.append(createSvgElement('line',{x1:34,x2:617,y1:y,y2:y,stroke:'#334155','stroke-dasharray':'3 7'}));
+      }
+      for (let k=0;k<7;k++) {
+        const x=34+k*94;
+        map.append(createSvgElement('line',{x1:x,x2:x,y1:20,y2:292,stroke:'#334155','stroke-dasharray':'3 7'}));
+      }
+      const polyline = positions.map(p=>`${p.x},${p.y}`).join(' ');
+      map.append(createSvgElement('polyline',{points:polyline,fill:'none',stroke:'#64748b','stroke-width':5,'stroke-linecap':'round',opacity:.7}));
+      map.append(createSvgElement('polyline',{points:polyline,fill:'none',stroke:'#a5f3fc','stroke-width':2,'stroke-dasharray':'8 6',opacity:.8}));
+      map.append(createSvgElement('text',{x:580,y:21,'font-size':12,fill:'#94a3b8','text-anchor':'end'},'N ↑'));
+      map.append(createSvgElement('text',{x:28,y:307,'font-size':11,fill:'#94a3b8'},'W ← Mountains'));
+      map.append(createSvgElement('text',{x:615,y:307,'font-size':11,fill:'#94a3b8','text-anchor':'end'},'Plains → E'));
+      positions.forEach((p,i)=>{
+        const selected = p.id === transectSelected;
+        const group = createSvgElement('g',{role:'button',tabindex:0,'aria-label':`${p.name}: ${metricLabels[transectMetric]} ${percent(p[transectMetric])}`});
+        const circle = createSvgElement('circle',{cx:p.x,cy:p.y,r:selected?11:8,fill:shade(p[transectMetric]),stroke:selected?'#ffffff':'#b5c7d6','stroke-width':selected?3:1.5});
+        group.append(circle);
+        const anchorX = i <= 2 ? p.x-14 : p.x+14;
+        const labelY = i===4 ? p.y+18 : i===5 ? p.y+17 : i===3 ? p.y-22 : p.y-12;
+        const label = createSvgElement('text',{x:anchorX,y:labelY,'text-anchor':i<=2?'end':'start',fill:'#eff6ff',stroke:'#081529','stroke-width':3,'paint-order':'stroke','font-size':11,'font-weight':600},p.name);
+        group.append(label);
+        const onSelect = ()=>{transectSelected=p.id;renderFoothillsTransect(h);};
+        group.addEventListener('click',onSelect);
+        group.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();onSelect();}});
+        group.style.cursor='pointer';
+        map.append(group);
+      });
+      // Interactive geographic basemap when Leaflet is available. The SVG
+      // remains a fast, self-contained fallback if a CDN/tile service is down.
+      const leafletCanvas=document.getElementById('transectLeaflet');
+      const coordinatePlot=document.getElementById('transectMap');
+      const mapSource=document.getElementById('transectMapSource');
+      if(window.L && leafletCanvas){
+        try {
+          leafletCanvas.classList.remove('hidden');
+          coordinatePlot.classList.add('hidden');
+          mapSource.textContent='OpenStreetMap contributors · markers colored by HRRR fields, NOT observations';
+          if(!leafletTransectMap){
+            leafletTransectMap=L.map(leafletCanvas,{scrollWheelZoom:false}).setView([40.009,-105.273],12);
+            L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{
+              attribution:'© OpenStreetMap contributors',maxZoom:18
+            }).addTo(leafletTransectMap);
+            leafletTransectLayers=L.layerGroup().addTo(leafletTransectMap);
+            const line=ROUTE_TARGETS.map(p=>[p.latitude,p.longitude]);
+            leafletTransectMap.fitBounds(L.latLngBounds(line).pad(.18));
+          }
+          leafletTransectLayers.clearLayers();
+          L.polyline(positions.map(p=>[p.latitude,p.longitude]),{
+            color:'#67e8f9',weight:3,dashArray:'7 6',opacity:.85
+          }).addTo(leafletTransectLayers);
+          for(const point of positions){
+            const marker=L.circleMarker([point.latitude,point.longitude],{
+              radius:point.id===transectSelected?12:9,
+              color:'#ffffff',weight:point.id===transectSelected?3:1.5,
+              fillColor:shade(point[transectMetric]),fillOpacity:.94
+            });
+            marker.bindTooltip(`${point.name} · ${metricLabels[transectMetric]} ${percent(point[transectMetric])}`);
+            marker.on('click',()=>{transectSelected=point.id;renderFoothillsTransect(h);});
+            marker.addTo(leafletTransectLayers);
+          }
+          window.setTimeout(()=>leafletTransectMap?.invalidateSize(),50);
+        }catch(error){
+          console.warn('Map tiles unavailable: falling back to coordinate plot',error);
+          leafletCanvas.classList.add('hidden');coordinatePlot.classList.remove('hidden');
+        }
+      }else if(leafletCanvas){
+        leafletCanvas.classList.add('hidden');coordinatePlot.classList.remove('hidden');
+        mapSource.textContent='Offline coordinate diagram · sample positions plotted to scale';
+      }
+      const selected = points.find(p=>p.id===transectSelected) || points[0];
+      const selectedIndex = points.findIndex(p=>p.id===selected.id);
+      const tiles = [
+        ['Selected location',selected.name],
+        [metricLabels[transectMetric],percent(selected[transectMetric])],
+        ['Low / mid / high',`${percent(selected.low_cloud_pct)} / ${percent(selected.mid_cloud_pct)} / ${percent(selected.high_cloud_pct)}`],
+        ['Surface RH',percent(selected.surface_rh_pct)],
+        ['RH at summit height',percent(selected.rh_at_summit_pct)],
+        ['HRRR grid terrain',finiteNumber(selected.grid_terrain_ft_msl) === null?'—':`${Math.round(selected.grid_terrain_ft_msl).toLocaleString()} ft`],
+      ];
+      details.replaceChildren();
+      for (const [label,value] of tiles) {
+        const card=document.createElement('div');card.className='rounded-xl bg-slate-900/85 border border-slate-800 p-3';
+        const title=document.createElement('p');title.className='text-[11px] text-slate-400';title.textContent=label;
+        const reading=document.createElement('p');reading.className='text-sm font-semibold text-slate-100 mt-1';reading.textContent=value;
+        card.append(title,reading);details.append(card);
+      }
+      // Relative humidity heatmap, rendered only within each point's
+      // above-ground pressure-level sample envelope. No extrapolation.
+      const levels = [10500,9500,8500,8133,7600,7258,7000,6500,6000,5500];
+      const cols = Array.isArray(data?.points) ? data.points : [];
+      matrix.replaceChildren();
+      if (!available) {
+        const message=document.createElement('p');message.className='text-sm text-amber-200 py-8';
+        message.textContent=state.isLive
+          ? 'This saved HRRR hour predates the spatial sampler. Choose “Load spatial data for selected hour” to fetch only the missing fields.'
+          : 'Spatial HRRR values are unavailable in synthetic demonstration mode.';
+        matrix.append(message);
+      } else {
+        const table=document.createElement('table');table.className='w-full border-separate border-spacing-[2px] text-[10px] text-slate-200';
+        const head=document.createElement('thead');const tr=document.createElement('tr');
+        for (const name of ['ft MSL',...cols.map(p=>p.name.split(' ')[0])]) {
+          const th=document.createElement('th');th.className='px-1 py-1.5 text-center text-slate-300';th.textContent=name;tr.append(th);
+        }
+        head.append(tr);table.append(head);
+        const body=document.createElement('tbody');
+        const rhAt=(point,at)=>{
+          const layers=point.humidity_by_height||[];
+          for(let i=1;i<layers.length;i++){
+            const a=layers[i-1],b=layers[i];
+            if(at>=a.height_ft_msl&&at<=b.height_ft_msl && b.height_ft_msl>a.height_ft_msl){
+              return a.rh_pct + (b.rh_pct-a.rh_pct)*(at-a.height_ft_msl)/(b.height_ft_msl-a.height_ft_msl);
+            }
+          }
+          return null;
+        };
+        for(const height of levels){
+          const tr=document.createElement('tr');
+          const th=document.createElement('th');th.className='text-right pr-2 py-1 whitespace-nowrap text-slate-400 font-mono';th.textContent=height.toLocaleString();tr.append(th);
+          cols.forEach(point=>{
+            const val=rhAt(point,height);
+            const cell=document.createElement('td');cell.textContent=percent(val);
+            cell.title=`${point.name}, ${height.toLocaleString()} ft: ${val==null?'not resolved':val.toFixed(1)+'% RH'}`;
+            cell.style.backgroundColor=shade(val);
+            cell.style.color=val==null?'#e2e8f0':'#07111f';
+            cell.style.opacity=point.id===selected.id?'1':'.86';
+            cell.className='text-center font-mono font-semibold rounded px-1 py-1';
+            tr.append(cell);
+          });
+          body.append(tr);
+        }
+        table.append(body);matrix.append(table);
+      }
+      document.getElementById('transectCells').textContent = available
+        ? `${data.unique_model_cells ?? '?'} distinct HRRR cells / ${points.length} locations`
+        : 'Grid cells: not downloaded';
+      document.getElementById('transectMapTime').textContent = h.timestamp
+        ? boulderTime(h.timestamp,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})
+        : 'No live HRRR spatial grid';
+      document.getElementById('transectProvenance').textContent = available
+        ? `NOAA HRRR ${h.run_utc} · F${h.lead_hours}. ${data.unique_model_cells??'Unknown number of'} distinct nearest-grid cells for ${points.length} markers. ` +
+          'Grid terrain is smoothed and differs from true summit height. The pressure-RH profile cannot directly resolve a shallow fog top.'
+        : 'Older cached hours have only Boulder grid-cell measurements. Spatial locations are shown for context, but no spatial values have been inferred.';
+      const button=document.getElementById('transectFetchButton');
+      button.disabled=!state.isLive || !h.timestamp || available || transectRefreshPolling;
+      button.textContent=available?'Spatial samples loaded for this hour':'Load spatial data for selected hour';
+      button.classList.toggle('opacity-50',available);
+      // Keep a link to a real geographic map; the SVG is only coordinate plot.
+      let link=document.getElementById('transectLocationLink');
+      if(!link){link=document.createElement('a');link.id='transectLocationLink';link.className='text-cyan-300 hover:text-cyan-100 underline text-xs';
+        document.getElementById('transectProvenance').after(link);}
+      link.href=`https://www.openstreetmap.org/?mlat=${selected.latitude}&mlon=${selected.longitude}#map=14/${selected.latitude}/${selected.longitude}`;
+      link.target='_blank';link.rel='noopener noreferrer';link.textContent=`View ${selected.name} on OpenStreetMap`;
+      if(available && selected.grid_id){link.title=`Nearest HRRR grid cell ${selected.grid_id}; different markers can share this cell`;}
+      // Official NOAA inventories describe the raw GRIB2 fields; the values
+      // in the map are extracted from those fields at nearest grid cells.
+      let sources=document.getElementById('transectNoaaSources');
+      if(!sources){
+        sources=document.createElement('div');sources.id='transectNoaaSources';
+        sources.className='flex flex-wrap gap-3 text-xs text-cyan-300';
+        link.after(sources);
+      }
+      sources.replaceChildren();
+      if(h.run_utc && finiteNumber(h.lead_hours)!==null){
+        const run=new Date(h.run_utc);
+        if(!Number.isNaN(run.getTime())){
+          const date=run.toISOString().slice(0,10).replaceAll('-','');
+          const hh=String(run.getUTCHours()).padStart(2,'0');
+          const ff=String(Math.round(h.lead_hours)).padStart(2,'0');
+          for(const [kind,label] of [['sfc','NOAA surface GRIB inventory'],['prs','NOAA pressure GRIB inventory']]){
+            const a=document.createElement('a');a.target='_blank';a.rel='noopener noreferrer';
+            a.href=`https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.${date}/conus/hrrr.t${hh}z.wrf${kind}f${ff}.grib2.idx`;
+            a.textContent=label;a.className='underline hover:text-white';sources.append(a);
+          }
+        }
+      }
+    }
+    function changeTransectMetric(metric) {
+      if(!['low_cloud_pct','mid_cloud_pct','high_cloud_pct','surface_rh_pct','rh_at_8133ft_pct'].includes(metric)) return;
+      transectMetric=metric;
+      const day=state.daysData?.[state.selectedDayIdx];
+      if(day)renderFoothillsTransect(day.hours[state.selectedHourIdx]||day.hours[0]);
+    }
+    async function fetchSelectedTransect() {
+      if(transectRefreshPolling || !state.isLive) return;
+      const day=state.daysData?.[state.selectedDayIdx];
+      const row=day?.hours[state.selectedHourIdx];
+      if(!row?.timestamp)return;
+      const chosenTime=row.timestamp;
+      const status=document.getElementById('transectFetchStatus');
+      transectRefreshPolling=true;
+      const button=document.getElementById('transectFetchButton');button.disabled=true;
+      try {
+        status.textContent='Starting selected-hour HRRR spatial download…';
+        const start=await fetch('/api/transect/refresh',{
+          method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({timestamp:chosenTime})
+        });
+        const started=await start.json();
+        if(!start.ok)throw Error(started.detail||'Could not start transect download');
+        let result=started;
+        for(let attempt=0;attempt<180 && result.state==='running';attempt++){
+          await new Promise(resolve=>setTimeout(resolve,1200));
+          const response=await fetch(`/api/transect/refresh/status?job_id=${encodeURIComponent(started.id)}`);
+          if(!response.ok)throw Error('Spatial job status is unavailable');
+          result=await response.json();
+          status.textContent=result.message||'Reading HRRR fields…';
+        }
+        if(result.state==='running')throw Error('Spatial download is still processing; reload to check later.');
+        if(result.state==='error')throw Error(result.message||'Spatial download failed');
+        // Reload the actual local forecast API, then restore the selected hour.
+        await fetchWeatherData(false);
+        for(let i=0;i<state.daysData.length;i++){
+          const j=state.daysData[i].hours.findIndex(h=>h.timestamp===chosenTime);
+          if(j>=0){state.selectedDayIdx=i;state.selectedHourIdx=j;renderSelectedDay();break;}
+        }
+        status.textContent='Spatial data loaded for this forecast hour.';
+      } catch(error) {
+        status.textContent=`Spatial retrieval: ${error.message}`;
+      } finally {
+        transectRefreshPolling=false;
+        const day=state.daysData?.[state.selectedDayIdx];
+        if(day)renderFoothillsTransect(day.hours[state.selectedHourIdx]||day.hours[0]);
       }
     }
 

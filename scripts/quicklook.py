@@ -64,7 +64,7 @@ def update_future(*, now, step=3, cache=CACHE, live=LIVE, fetcher=None,
     """Fetch missing point forecasts with per-pair persistent cache, atomic live output."""
     from inversion.history import capture_published_live
     from inversion.hrrr import fetch_point
-    fetcher = fetcher or fetch_point
+    fetcher = fetcher or (lambda init, lead, scratch: fetch_point(init, lead, scratch, transect=True))
     now = as_utc(now)
     init = issue_cycle(now, availability_lag_hours=lag_hours)
     targets = hourly_targets(now, 48, step, future=True, dawn_hours=dawn_hours)
