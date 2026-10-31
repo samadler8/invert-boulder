@@ -78,6 +78,11 @@ def update_future(*, now, step=3, cache=CACHE, live=LIVE, fetcher=None,
     skipped = len(targets) - len(leads)
     print(f'Future: {len(leads)} forecast hours from HRRR {utc_str(init)} '
           f'(up to F48), {skipped} beyond available run horizon.', flush=True)
+    # Dawn hours are the actual use case. If refresh is capped at six new
+    # downloads, retrieve mornings BEFORE less important afternoon hours.
+    leads = sorted(leads, key=lambda lead: (
+        0 if (init + timedelta(hours=lead)).astimezone(LOCAL).hour in dawn_hours else 1,
+        init + timedelta(hours=lead)))
     for lead in leads:
         key = (utc_str(init), lead)
         if key in saved:
@@ -113,6 +118,13 @@ def update_future(*, now, step=3, cache=CACHE, live=LIVE, fetcher=None,
               f'failed: {failed}; archive: {counts}', flush=True)
     else:
         print('  No new forecasts available; existing live file left untouched.', flush=True)
+    # Keep the on-disk per-run cache bounded, including for CLI-only refreshes.
+    if Path(cache).resolve() == CACHE.resolve():
+        try:
+            from inversion.storage import forecast_prune
+            forecast_prune(cache, now=now, apply=True)
+        except (OSError, ValueError, KeyError) as exc:
+            print(f'  Cache maintenance deferred: {exc}', flush=True)
     return {'fetched': fetched, 'available': len(rows), 'failed': failed,
             'outside_horizon': skipped, 'run_utc': utc_str(init)}
 

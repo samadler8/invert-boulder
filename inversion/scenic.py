@@ -13,7 +13,7 @@ import math
 from .config import (FEATURE_NAMES, LANDMARKS_FT, OBS_STATION_ELEV_FT,
                      PROFILE_LEVELS, PROFILE_TOP_AGL_M)
 
-VERSION = 'hrrr-scenic-suitability-v3-precise-elevations'
+VERSION = 'hrrr-scenic-suitability-v4-corridor-payload'
 BOULDER_FT_MSL = LANDMARKS_FT['Boulder']
 MAX_DESIRED_DECK_TOP_FT_MSL = BOULDER_FT_MSL + 2000
 FT_PER_M = 3.280839895

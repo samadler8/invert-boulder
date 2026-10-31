@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 from .config import DATA_DIR, MAX_LEAD_HOURS, DISPLAY_MAX_LEAD_HOURS, TIMEZONE
 from .heuristic import evaluate, VERSION as HEURISTIC_VERSION
 from .scenic import VERSION as SCENIC_VERSION
+from .opportunity import evaluate_opportunity
 
 DEFAULT_DB = DATA_DIR / 'forecast_history.sqlite3'
 DEFAULT_OFFSETS = (24, 18, 12, 6, 0)
@@ -100,7 +101,7 @@ def connect(path=DEFAULT_DB):
 def compact_prediction(row, predicted=None):
     """Freeze computed values, not just inputs, so future code cannot alter history."""
     heur = evaluate(row)
-    out = {**heur,
+    out = {**heur, **evaluate_opportunity(row, heur),
            'lowClouds': row.get('observables', {}).get('lowClouds'),
            'rh': row.get('observables', {}).get('rh'),
            'windSpeed': row.get('observables', {}).get('windSpeed'),

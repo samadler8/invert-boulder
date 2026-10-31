@@ -42,3 +42,9 @@ data/*.csv
 # Local immutable forecast-vintage ledger
 /data/forecast_history.sqlite3*
 /data/hrrr_live.jsonl.next
+
+# Local published forecast/observation cache files (do not commit personal local state)
+/data/*.json
+/data/*.json.next
+/data/*.cleanup-next
+/data/*.transect-next

@@ -11,6 +11,7 @@ Do not download full CONUS GRIB files; use only indexed message subsets.
 import argparse
 import json
 import math
+import warnings
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -223,8 +224,17 @@ def fetch_point(init, fxx, scratch, *, transect=False):
 def load_jsonl(path):
     if not Path(path).exists():
         return []
-    with open(path) as stream:
-        return [json.loads(line) for line in stream if line.strip()]
+    with open(path, encoding='utf-8') as stream:
+        lines = [line for line in stream if line.strip()]
+    rows=[]
+    for i,line in enumerate(lines):
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            if i != len(lines)-1:
+                raise ValueError(f'Corrupt non-terminal JSONL entry {i+1} in {path}') from exc
+            warnings.warn(f'Skipping incomplete trailing JSONL entry in {path}; prior complete entries preserved', stacklevel=2)
+    return rows
 
 
 def write_jsonl(path, rows, mode='a'):

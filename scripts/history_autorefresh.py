@@ -16,9 +16,8 @@ LABEL = 'org.invertboulder.hrrr-history'
 def plist_definition(python_executable=sys.executable, root=ROOT, seconds=21600):
     return {
         'Label': LABEL,
-        'ProgramArguments': [str(python_executable), '-m', 'inversion.hrrr', 'live',
-                             '--lead-hours', '12,18,24,30,36,39',
-                             '--morning-hours', '5,6,7,8,9'],
+        'ProgramArguments': [str(python_executable), '-m', 'scripts.quicklook', '--no-past', '--refresh-only',
+                             '--max-new', '8'],
         'WorkingDirectory': str(root),
         'RunAtLoad': True,
         'StartInterval': seconds,

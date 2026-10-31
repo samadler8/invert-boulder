@@ -34,7 +34,7 @@ def sample_fieldmaps():
 
 
 def test_location_count_and_precise_coordinates():
-    assert len(TRANSECT_POINTS) == 6
+    assert len(TRANSECT_POINTS) == 10
     assert next(p for p in TRANSECT_POINTS if p[0]=='flatiron')[4] == 7258
     assert next(p for p in TRANSECT_POINTS if p[0]=='green')[4] == 8133
 
@@ -49,9 +49,9 @@ def test_vertical_rh_height_interpolation_and_missing_range():
 def test_assemble_tracks_grid_terrain_and_summit_without_claiming_cloud_top():
     s, p = sample_fieldmaps()
     result=assemble(s,p)
-    assert result['version'].endswith('v1')
-    assert len(result['points'])==6
-    assert result['unique_model_cells']==6
+    assert result['version'] == __import__('inversion.transect', fromlist=['TRANSECT_VERSION']).TRANSECT_VERSION
+    assert len(result['points'])==len(TRANSECT_POINTS)
+    assert result['unique_model_cells']==len(TRANSECT_POINTS)
     g=next(point for point in result['points'] if point['id']=='green')
     assert g['summit_elevation_ft_msl']==8133
     assert g['grid_terrain_ft_msl'] > 5000
@@ -60,7 +60,7 @@ def test_assemble_tracks_grid_terrain_and_summit_without_claiming_cloud_top():
     assert all(point['grid_distance_km']==.2 for point in result['points'])
     # Missing pressure samples do not become invented height-resolved RH.
     p['_transect_fields']['green']={}
-    g=assemble(s,p)['points'][-1]
+    g=next(point for point in assemble(s,p)['points'] if point['id']=='green')
     assert g['rh_at_summit_pct'] is None
 
 
@@ -94,7 +94,7 @@ def test_hrrr_downloader_reads_grid_values_without_array_materialization(tmp_pat
     fake_herbie.Herbie=Herbie
     monkeypatch.setitem(sys.modules,'herbie',fake_herbie)
     data=download_product(datetime(2026,10,30,tzinfo=timezone.utc),8,'sfc','anything',tmp_path,transect=True)
-    assert len(data['_transect_fields'])==6
+    assert len(data['_transect_fields'])==len(TRANSECT_POINTS)
     first=data['_transect_fields']['kbdu']
     assert first[('HGT','surface')] > 10
     assert first['_grid']['latitude'] > 40
@@ -137,7 +137,7 @@ def test_transect_refresh_endpoint_enriches_one_existing_hour(tmp_path,monkeypat
     assert all(kwargs['transect'] for _,_,kwargs in calls)
     live=load_jsonl(tmp_path/'hrrr_live.jsonl')[0]
     cache=load_jsonl(tmp_path/'quicklook_forecast_cache.jsonl')[0]
-    assert len(live['observables']['foothills_transect']['points'])==6
+    assert len(live['observables']['foothills_transect']['points'])==len(TRANSECT_POINTS)
     assert cache['observables']['foothills_transect']==live['observables']['foothills_transect']
     assert len(live['features'])==23
     assert client.post('/api/transect/refresh',json={'timestamp':'not-a-date'}).status_code==400

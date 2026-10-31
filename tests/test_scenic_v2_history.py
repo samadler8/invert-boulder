@@ -39,7 +39,7 @@ def test_smooth_sky_penalty_respects_middle_vs_high_clouds():
     assert results['mixed']['scenic_heuristic_score'] > results['high_overcast']['scenic_heuristic_score']
     assert results['high_overcast']['scenic_heuristic_score'] > results['middle_overcast']['scenic_heuristic_score'] > 0
     assert all(r['heuristic_score'] == results['clear']['heuristic_score'] for r in results.values())
-    assert all(r['scenic_version'].endswith('v3-precise-elevations') for r in results.values())
+    assert all(r['scenic_version'] == __import__('inversion.scenic', fromlist=['VERSION']).VERSION for r in results.values())
 
 
 def test_spatial_samples_are_optional_and_do_not_invent_certainty():

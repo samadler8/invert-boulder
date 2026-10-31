@@ -1,4 +1,4 @@
-"""The combined button refreshes future, history, observations in sequence."""
+"""The combined button refreshes five independent sources in order."""
 from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 from inversion import server
@@ -8,6 +8,10 @@ def test_refresh_all_sequence(monkeypatch):
     calls = []
     import scripts.quicklook as quicklook
     import scripts.refresh_observations as observations
+    import inversion.nearby as nearby
+    import inversion.nws as nws
+    monkeypatch.setattr(nearby, 'refresh_nearby', lambda **kw: calls.append('nearby') or {'stations': 2})
+    monkeypatch.setattr(nws, 'refresh_nws', lambda **kw: calls.append('nws') or {'hours': 24})
     monkeypatch.setattr(quicklook, 'update_future', lambda **kw: calls.append('future') or {'fetched': 1})
     monkeypatch.setattr(server, 'history_view', lambda *a, **kw: {
         'comparisons': [{'hours_before_event': h, 'forecast': None}
@@ -23,13 +27,17 @@ def test_refresh_all_sequence(monkeypatch):
     status = client.get('/api/refresh/all/status', params={'job_id': response.json()['id']})
     assert status.status_code == 200
     assert status.json()['state'] == 'complete'
-    assert calls == ['future'] + ['history'] * 5 + ['observations']
+    assert calls == ['future'] + ['history'] * 5 + ['observations', 'nearby', 'nws']
 
 
 def test_refresh_all_continues_if_future_fails(monkeypatch):
     calls = []
     import scripts.quicklook as quicklook
     import scripts.refresh_observations as observations
+    import inversion.nearby as nearby
+    import inversion.nws as nws
+    monkeypatch.setattr(nearby, 'refresh_nearby', lambda **kw: calls.append('nearby') or {'stations': 2})
+    monkeypatch.setattr(nws, 'refresh_nws', lambda **kw: calls.append('nws') or {'hours': 24})
     def failed_future(**kw):
         calls.append('future')
         raise RuntimeError('simulated NOAA outage')
@@ -45,5 +53,5 @@ def test_refresh_all_continues_if_future_fails(monkeypatch):
     assert response.status_code == 202
     job = client.get('/api/refresh/all/status', params={'job_id': response.json()['id']}).json()
     assert job['state'] == 'complete'
-    assert [x['status'] for x in job['results']] == ['error', 'ok', 'ok']
-    assert calls == ['future'] + ['history'] * 5 + ['observations']
+    assert [x['status'] for x in job['results']] == ['error', 'ok', 'ok', 'ok', 'ok']
+    assert calls == ['future'] + ['history'] * 5 + ['observations', 'nearby', 'nws']

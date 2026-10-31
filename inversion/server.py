@@ -15,9 +15,10 @@ from .config import ROOT, DATA_DIR, MODEL_DIR, DISPLAY_MAX_LEAD_HOURS
 from .heuristic import evaluate, VERSION, WEIGHTS
 from .scenic import VERSION as SCENIC_VERSION, MAX_DESIRED_DECK_TOP_FT_MSL
 from .hrrr import load_jsonl
+from .opportunity import evaluate_opportunity, VERSION as OPPORTUNITY_VERSION
 from .history import DEFAULT_DB, history_view, timeline_view, save_prediction, backfill_event, as_utc, utc_str
 
-app = FastAPI(title='Boulder HRRR Inversion Setup', version='5.0.0')
+app = FastAPI(title='Boulder Inversion Outlook', version='6.0.0')
 
 
 @app.get('/')
@@ -43,6 +44,24 @@ def solar(date_local: str | None = None):
     except ValueError as exc:
         raise HTTPException(400, 'Expected ISO calendar date YYYY-MM-DD') from exc
     return solar_day(day)
+
+
+@app.get('/api/observations/nearby')
+def nearby_observations():
+    from .nearby import cached_nearby
+    return cached_nearby(DATA_DIR / 'observed_nearby.json')
+
+
+@app.get('/api/nws')
+def nws_outlook():
+    from .nws import cached_nws
+    return cached_nws(DATA_DIR / 'nws_hourly.json')
+
+
+@app.get('/api/storage')
+def storage_status():
+    from .storage import status
+    return status(DATA_DIR)
 
 
 @app.get('/api/health')
@@ -72,10 +91,11 @@ def forecast(refresh: bool = False):
 
     out = []
     for r in rows:
+        base_evaluation = evaluate(r)
         out.append({
             'timestamp': r['timestamp'], 'run_utc': r['run_utc'],
             'lead_hours': r['lead_hours'], 'local_time': r['local_time'],
-            **r['observables'], **evaluate(r),
+            **r['observables'], **base_evaluation, **evaluate_opportunity(r, base_evaluation),
             'ml_probability': None, 'xgb_probability': None,
             'cnn_probability': None, 'event': None,
             'estimated_low_cloud_base_ft_msl': None,
@@ -95,10 +115,12 @@ def forecast(refresh: bool = False):
         'heuristic': {
             'available': True, 'version': VERSION, 'weights': WEIGHTS,
             'quantity': '0-100 low-cloud/inversion-setup favorability index, NOT a probability',
-            'warning': ('Two separate hand-designed indices: airport low-cloud setup and mountain scenic suitability. '
+            'warning': ('The public dashboard presents a single corridor opportunity index. Underlying low-cloud and summit diagnostic scores are available for explanation. '
                         'Neither is a probability. Scenic suitability explicitly penalizes mid/high cloud '
                         'and uses coarse HRRR humidity profiles as an unvalidated proxy for low-deck depth.'),
         },
+        'opportunity': {'version': OPPORTUNITY_VERSION, 'name': 'Boulder inversion opportunity',
+                        'quantity': '0-100 uncalibrated index, not event probability'},
         'scenic': {
             'available': True, 'version': SCENIC_VERSION,
             'main_landmark': 'Green Mountain',
@@ -278,7 +300,7 @@ def _run_refresh_all(job_id, target):
         now = datetime.now(timezone.utc)
         # Keep this fast(er) by reusing the durable per-run cache. Future forecasts
         # come first and successful downloads remain saved if a later step fails.
-        attempt('future', '1/3 · Checking latest HRRR future forecasts (up to 6 new hours)…',
+        attempt('future', '1/5 · Checking latest HRRR future forecasts (up to 6 new hours)…',
                 lambda: update_future(now=now, step=3, stop_after=6))
 
         def historical():
@@ -300,7 +322,7 @@ def _run_refresh_all(job_id, target):
                            if needs_reconstruction_upgrade(c['forecast']))
             result = []
             for number, offset in enumerate(needed, 1):
-                progress('history', f'2/3 · Historical forecast {number}/{len(needed)}: T−{offset}h…')
+                progress('history', f'2/5 · Historical forecast {number}/{len(needed)}: T−{offset}h…')
                 try:
                     result.extend(backfill_event(chosen, offsets=(offset,),
                                                  db_path=DATA_DIR / 'forecast_history.sqlite3'))
@@ -309,14 +331,29 @@ def _run_refresh_all(job_id, target):
                                    'message': f'{type(exc).__name__}: {exc}'})
             return {'target_utc': utc_str(chosen), 'checked': 5,
                     'updated': sum(r.get('status') == 'saved' for r in result), 'results': result}
-        attempt('history', '2/3 · Updating historical T−24/18/12/6/0 for selected hour…', historical)
+        attempt('history', '2/5 · Updating historical T−24/18/12/6/0 for selected hour…', historical)
 
         def observations():
             # Small independent airport observation window, not long-term training.
             start = (now - timedelta(hours=55)).date()
             return refresh_observations(start, now.date(),
                    output=DATA_DIR / 'observed_recent_bdu.csv')
-        attempt('observations', '3/3 · Updating actual KBDU airport observations…', observations)
+        attempt('observations', '3/5 · Updating actual KBDU airport observations…', observations)
+        def nearby():
+            from .nearby import refresh_nearby
+            return refresh_nearby(now=now, output=DATA_DIR / 'observed_nearby.json')
+        attempt('nearby', '4/5 · Updating nearby airport observations…', nearby)
+        def nws():
+            from .nws import refresh_nws
+            return refresh_nws(now=now, output=DATA_DIR / 'nws_hourly.json')
+        attempt('nws', '5/5 · Updating independent NWS hourly guidance…', nws)
+        # Discard stale scratch and old point-cache entries; preserve all SQLite
+        # forecast vintages and the user's historical training collection.
+        try:
+            from .storage import cleanup
+            cleanup(DATA_DIR, now=now, apply=True)
+        except Exception as exc:
+            results.append({'stage': 'maintenance', 'status': 'warning', 'message': str(exc)})
         _refresh_set(job_id, state='complete', stage='complete',
                      message='Refresh completed. Updated local forecast and history views.',
                      results=list(results))

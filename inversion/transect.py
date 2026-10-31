@@ -17,8 +17,14 @@ TRANSECT_POINTS = (
     ('chautauqua', 'Chautauqua', 39.9978, -105.2814, None),
     ('flatiron', 'First Flatiron', 39.990472, -105.294667, 7258),
     ('green', 'Green Mountain', 39.9794304, -105.3016578, 8133),
+    # Additional independent nearest-grid targets. Named landmarks aren't
+    # guaranteed to be independent model cells at HRRR's ~3 km resolution.
+    ('flagstaff', 'Flagstaff Mountain', 40.0016525, -105.3074913, 6983),
+    ('ncar', 'NCAR Mesa Lab', 39.97777, -105.274966, None),
+    ('south_mesa', 'South Mesa Trailhead', 39.93872, -105.258132, None),
+    ('walker', 'Walker Ranch', 39.951238, -105.338, None),
 )
-TRANSECT_VERSION = 'boulder-foothills-grid-transect-v1'
+TRANSECT_VERSION = 'boulder-foothills-grid-transect-v2'
 FT_M = 3.280839895
 # The additional GRIB fields are already inside the existing 13 surface and
 # 25 pressure records; no full CONUS files or additional products required.

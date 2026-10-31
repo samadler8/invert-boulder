@@ -1,4 +1,4 @@
-"""Print separate scenic and low-cloud indices, raw HRRR inputs and scoring rules.
+"""Inspect one overall Boulder inversion opportunity score and the raw HRRR evidence.
 
 Examples:
   python -m scripts.explain_forecast --date 2026-10-31 --top 5
@@ -11,6 +11,7 @@ from pathlib import Path
 
 from inversion.config import DATA_DIR
 from inversion.heuristic import evaluate
+from inversion.opportunity import evaluate_opportunity
 from inversion.hrrr import load_jsonl
 
 
@@ -20,7 +21,7 @@ def main():
     parser.add_argument('--date', help='Target date in Boulder time (YYYY-MM-DD)')
     parser.add_argument('--hour', type=int, choices=range(24), metavar='0..23',
                         help='Target local hour (0-23); omit for all hours')
-    parser.add_argument('--top', type=int, default=5, help='Highest Green Mountain scenic index hours')
+    parser.add_argument('--top', type=int, default=5, help='Highest Boulder inversion opportunity index hours')
     args = parser.parse_args()
     if args.top < 1:
         parser.error('--top must be positive')
@@ -34,13 +35,14 @@ def main():
             continue
         if args.hour is not None and int(local_time[11:13]) != args.hour:
             continue
-        selected.append((evaluate(row), row))
-    selected.sort(key=lambda item: item[0]['scenic_heuristic_score'] if item[0]['scenic_heuristic_score'] is not None else -1, reverse=True)
+        original = evaluate(row)
+        selected.append(({**original, **evaluate_opportunity(row, original)}, row))
+    selected.sort(key=lambda item: item[0]['opportunity_score'] if item[0]['opportunity_score'] is not None else -1, reverse=True)
     if not selected:
         print('No matching forecasts in the current cache. Check available valid times or run HRRR live with --morning-hours 5,6,7,8,9.')
         return
     for result, row in selected[:args.top]:
-        print(f"\n{row['local_time']} | Green Mt scenic {result['scenic_heuristic_score'] if result['scenic_heuristic_score'] is not None else 'N/A'}/100, low-cloud setup {result['heuristic_score']}/100")
+        print(f"\n{row['local_time']} | Boulder inversion opportunity {result['opportunity_score'] if result['opportunity_score'] is not None else 'N/A'}/100")
         print(f"HRRR run {row['run_utc']} | F{int(row['lead_hours']):02d} | Uncalibrated indices, NOT probabilities")
         print(f"Calculation: {result['heuristic_unrounded_score']:.2f} weighted points -> {result['heuristic_score']}/100")
         for part in result['heuristic_breakdown']:
@@ -48,8 +50,8 @@ def main():
                                else f"{v['label']}=missing" for v in part['readings'])
             missing = ' [missing input: neutral fallback]' if part['has_missing_readings'] else ''
             print(f"  {part['weighted_points']:5.2f}/{part['max_points']:g} points  {part['label']} ({part['factor_score']:.1f}/100): {values}{missing}")
-        print('Scenic assessment:', result['scenic_heuristic_reason'])
-        print('First Flatiron scenic:', result['scenic_flatiron_score'])
+        print('Opportunity interpretation:', result['opportunity_label'])
+        print('Uncertainty:', '; '.join(result['opportunity_evidence']['data_issues']) or 'Model uncertainty remains.')
         for k, v in result['scenic_indicators'].items():
             print(f'  {k}: {v}')
         print('RH-profile drying transition (not a cloud top):', result['scenic_profile_drying_transition_ft_msl'])

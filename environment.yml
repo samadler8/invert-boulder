@@ -4,12 +4,6 @@ channels:
 dependencies:
   - python=3.12
   - numpy
-  - pandas
-  - scipy
-  - scikit-learn
-  - pytorch
-  - py-xgboost
-  - llvm-openmp
   - herbie-data
   - python-eccodes
   - requests

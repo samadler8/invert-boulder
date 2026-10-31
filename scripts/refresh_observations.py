@@ -35,8 +35,22 @@ def refresh_observations(start, end, *, output=RECENT, fetcher=None):
     staging = path.with_name(path.name + '.next')
     save_csv([by_hour[key] for key in sorted(by_hour)], staging)
     staging.replace(path)
-    return {'new_reports': len(fresh), 'total_cached_hours': len(by_hour),
-            'source': 'IEM KBDU METAR', 'path': str(path)}
+    result = {'new_reports': len(fresh), 'total_cached_hours': len(by_hour),
+              'source': 'IEM KBDU METAR', 'path': str(path)}
+    # Optional independent neighboring airports. The primary KBDU report succeeds
+    # even when the secondary IEM request fails. Test fetchers do not hit network.
+    if fetcher is download_iem and path == RECENT:
+        try:
+            from inversion.nearby import refresh_nearby
+            result['nearby'] = refresh_nearby()
+        except Exception as exc:
+            result['nearby'] = {'status':'unavailable', 'reason': str(exc)}
+        try:
+            from inversion.nws import refresh_nws
+            result['nws'] = refresh_nws()
+        except Exception as exc:
+            result['nws'] = {'status':'unavailable', 'reason': str(exc)}
+    return result
 
 
 def main():
